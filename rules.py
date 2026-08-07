@@ -6,13 +6,12 @@
   - 异常标红走规则
   - LLM 只做自然语言润色, 不参与判定
 
-参考范围 (handoff.md L25-L32):
+参考范围:
   LVEF  ≥50%        <50 标红
   LVEDD 42-58 mm    超范围标红
   LVESD 25-37 mm    超范围标红
   LAD   27-38 mm    超范围标红
   E/A   0.8-1.5     超范围标红
-  GLS   ≤-16%       >-16 标红
 """
 from typing import Optional
 
@@ -23,8 +22,7 @@ REFERENCE_RANGES = {
     "LVEDD": (42, 58),       # 42-58 正常, 超范围标红
     "LVESD": (25, 37),       # 25-37 正常, 超范围标红
     "LAD":   (27, 38),       # 27-38 正常, 超范围标红
-    "E/A":   (0.8, 1.5),     # 0.8-1.5 正常, 超范围标红
-    "GLS":   (None, -16),    # ≤-16 正常, >-16 标红 (上界异常, 负值)
+    "MV_EA": (0.8, 1.5),     # 0.8-1.5 正常, 超范围标红
 }
 
 
@@ -50,12 +48,11 @@ def flag_abnormal(metric: str, value: Optional[float]) -> bool:
     """
     判定指标是否异常 (需标红)。
 
-    - GLS=null: 不标红 (架构决策, GLS 砍掉返回 null, 标注"未测量")
-    - 其他 null: 视为异常 (数据缺失应提醒)
+    - null: 不标红 (数据缺失不报警)
     - 数值: 超出参考范围即异常
     """
     if value is None:
-        return False  # null 不标红 (GLS 砍掉的场景)
+        return False
     low, high = REFERENCE_RANGES[metric]
     if low is not None and value < low:
         return True
@@ -65,18 +62,17 @@ def flag_abnormal(metric: str, value: Optional[float]) -> bool:
 
 
 def analyze(lvef: Optional[float], lvedd: float, lvesd: float, lad: float,
-            ea: Optional[float], gls: Optional[float]) -> dict:
+            mv_ea: Optional[float]) -> dict:
     """
-    规则引擎汇总: 6 项指标 + HF 分型。
+    规则引擎汇总: 5 项指标 + HF 分型。
 
-    返回接口契约: {lvef, lvedd, lvesd, lad, ea, gls, hf_type}
+    返回接口契约: {lvef, lvedd, lvesd, lad, mv_ea, hf_type}
     """
     return {
         "lvef": lvef,
         "lvedd": lvedd,
         "lvesd": lvesd,
         "lad": lad,
-        "ea": ea,
-        "gls": gls,
+        "mv_ea": mv_ea,
         "hf_type": classify_hf(lvef),
     }

@@ -1,18 +1,23 @@
 """
 心衰诊断 API (异步任务模式, 支持心超 + ECG 混合任务)。
 
-遵循《图像算法分析接口协议》:
+遵循《图像算法分析接口协议 v3》:
   POST /heart-algo/task/start  → 启动分析任务 (BackgroundTasks 异步)
   POST /heart-algo/task/result → 查询任务结果
 
-任务可含心超图 (Cardiac Ultrasound) 和/或心电信号 (ECG XML):
-  - 心超: EchoNetRunner → 6 项指标 + HF 分型
-  - ECG:  ECGFMRunner  → 疾病概率 Top-K
-  - 混合: CombinedRunner 分流后合并
+v3 请求体按切面分组:
+  cardiacUltrasound: [{dcmType, dcms:[{dcmId, dcmPath}]}]
+  ecg: [{ecgId, ecgPath}]
+
+v3 响应体心超与 ECG 分离:
+  cardiacUltrasound: [{dcmId, dcmPath, reportId, rois:[{roiType, points}]}]
+  ecg: [{ecgId, ecgPath, reportId}]
+  reports: [{reportId, reportType, reportResult(JSON 字符串)}]
 """
 from __future__ import annotations
 
-from typing import Callable, Optional, Protocol
+import json
+from typing import Callable, Literal, Optional, Protocol
 
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel, Field
@@ -20,17 +25,75 @@ from pydantic import BaseModel, Field
 from rules import analyze
 
 
-class ImgItem(BaseModel):
-    imgId: str
-    imgPath: str
-    imgType: str  # "Cardiac Ultrasound" | "ECG"
+# ────────────────── 指标元数据 (中文名/单位/参考范围) ──────────────────
+
+METRIC_META: dict[str, dict[str, str]] = {
+    # B-Mode 距离/厚度 (mm)
+    "aorticroot":  {"name_cn": "主动脉根部内径",     "unit": "mm",   "reference": "20–37"},
+    "aorta":       {"name_cn": "升主动脉内径",       "unit": "mm",   "reference": "20–37"},
+    "lad":         {"name_cn": "左房内径",          "unit": "mm",   "reference": "19–40"},
+    "lvedd":       {"name_cn": "左室舒末径",        "unit": "mm",   "reference": "35–55"},
+    "lvesd":       {"name_cn": "左室缩末径",        "unit": "mm",   "reference": "25–35"},
+    "ivs":         {"name_cn": "室间隔厚",          "unit": "mm",   "reference": "6–11"},
+    "lvpw":        {"name_cn": "左室后壁厚",        "unit": "mm",   "reference": "6–11"},
+    "rvbase":      {"name_cn": "右室内径",          "unit": "mm",   "reference": "0–20"},
+    "ivc":         {"name_cn": "下腔静脉内径",      "unit": "mm",   "reference": "10–25"},
+    "pa":          {"name_cn": "主肺动脉",          "unit": "mm",   "reference": "0–26"},
+    "lvef":        {"name_cn": "左室射血分数(EF)",   "unit": "%",    "reference": "55–70"},
+    # Doppler 流速 (cm/s)
+    "mv_e":        {"name_cn": "二尖瓣E峰流速",     "unit": "cm/s", "reference": "60–130"},
+    "mv_a":        {"name_cn": "二尖瓣A峰流速",     "unit": "cm/s", "reference": "40–100"},
+    "mv_ea":       {"name_cn": "E/A",              "unit": "-",    "reference": "0.8–2.0"},
+    "av_vmax":     {"name_cn": "主动脉瓣峰值流速",   "unit": "cm/s", "reference": "70–220"},
+    "tr_vmax":     {"name_cn": "三尖瓣反流峰值流速", "unit": "cm/s", "reference": "≤280"},
+    "mr_vmax":     {"name_cn": "二尖瓣反流峰值流速", "unit": "cm/s", "reference": "—"},
+    "lvot_vmax":   {"name_cn": "左室流出道峰值流速", "unit": "cm/s", "reference": "70–120"},
+    # TDI (cm/s)
+    "tdi_lateral": {"name_cn": "二尖瓣环侧壁 e'",   "unit": "cm/s", "reference": "≥10"},
+    "tdi_medial":  {"name_cn": "二尖瓣环间隔侧 e'", "unit": "cm/s", "reference": "≥7"},
+    # M-Mode (mm)
+    "tapse":       {"name_cn": "TAPSE",            "unit": "mm",   "reference": "≥17"},
+}
+
+
+# ────────────────── v3 请求体模型 ──────────────────
+
+class DcmItem(BaseModel):
+    """心超 dcm 影像图。"""
+
+    dcmId: str
+    dcmPath: str
+
+
+class CardiacUltrasoundGroup(BaseModel):
+    """心超数据分组, 按 dcmType 切面类型分组。
+
+    dcmType 合法值 (SLICE_DIR_MAP key):
+      分支1 B-Mode: PLAX / A4C / Subcostal / RVOT
+      分支2 Doppler: MV_EA / AV_Vmax / TR_Vmax / MR_Vmax / LVOT_Vmax
+      分支3 TDI: TDI_Medial / TDI_Lateral
+      分支4 M-Mode: TAPSE
+    """
+
+    dcmType: str
+    dcms: list[DcmItem]
+
+
+class EcgItem(BaseModel):
+    """心电图数据。"""
+
+    ecgId: str
+    ecgPath: str
 
 
 class StartRequest(BaseModel):
+    """v3 start 请求: 心超按切面分组 + ECG 列表。"""
+
     requestId: str
     sysUserId: str
     taskId: str
-    imgs: list[ImgItem]
+    cardiacUltrasound: list[CardiacUltrasoundGroup] = Field(default_factory=list)
+    ecg: list[EcgItem] = Field(default_factory=list)
 
 
 class StartResponse(BaseModel):
@@ -47,92 +110,68 @@ class ResultRequest(BaseModel):
     taskId: str
 
 
-class ECGPrediction(BaseModel):
-    """One ECG-FM disease label and its sigmoid probability."""
+# ────────────────── 内部展平模型 (runner 接口) ──────────────────
 
-    label: str
-    probability: float
+class ImgItem(BaseModel):
+    """内部展平后的图像项, 由 start 请求体转换而来。
 
-
-class ECGMeasurements(BaseModel):
-    """ECG 测量值 (改进 #8, 同事贡献: parse_ecg_xml 解析 HL7 aECG XML 提取)。
-
-    所有字段 Optional, 缺失时返回 null (exclude_none=True 会剔除)。
+    dcmType 仅心超图有值 (从 CardiacUltrasoundGroup.dcmType 带下), ECG 为 None。
+    runner 按 dcmType 查 DCM_TYPE_TASKS 表做切面分流。
     """
 
-    ventRate: Optional[float] = None
-    prInterval: Optional[float] = None
-    qrsDuration: Optional[float] = None
-    qt: Optional[float] = None
-    qtc: Optional[float] = None
-    pAxis: Optional[float] = None
-    qrsAxis: Optional[float] = None
-    tAxis: Optional[float] = None
+    imgId: str
+    imgPath: str
+    imgType: str  # "Cardiac Ultrasound" | "ECG"
+    dcmType: Optional[str] = None
 
 
-class ECGPatientInfo(BaseModel):
-    """ECG 患者信息 (改进 #8, 同事贡献: parse_ecg_xml 提取)。"""
-
-    name: Optional[str] = None
-    age: Optional[int] = None
-    sex: Optional[str] = None
-
+# ────────────────── v3 响应体模型 ──────────────────
 
 class RoiPoint(BaseModel):
-    """ROI 线段端点坐标。"""
+    """ROI 区域的坐标点。"""
 
     xPos: int
     yPos: int
 
 
-class RoiSegment(BaseModel):
-    """结构化 ROI 线段 (D 方案): 类型 + 帧号 + 两点坐标。
+class Roi(BaseModel):
+    """心超测量区域。
 
-    type: "LVEDD" | "LVESD" | "LAD" (左室舒张末径 / 收缩末径 / 左房径)
-    frameIndex: 线段取自多帧 DICOM 的第几帧 (0-based)
-    points: 线段两端点 [point1, point2]
+    roiType 为指标名 (非几何类型), 合法值:
+      PLAX: IVS / LVEDD / LVESD / LVPW / LA / Aorta / AorticRoot
+      A4C:  RVBase
+      Subcostal: IVC
+      RVOT:  PA
+      Doppler/TDI/M-Mode: 对应指标名或空 rois
     """
 
-    type: str
-    frameIndex: int
+    roiType: str
     points: list[RoiPoint]
 
 
 class Report(BaseModel):
-    """协议 reports[].report: 单个分析报告。"""
+    """单个模型分析报告, reportResult 为 JSON 字符串。"""
 
     reportId: str
-    reportResult: list[str]
+    reportType: Literal["ECGFM", "MEASUREMENT"]
+    reportResult: str
 
 
-class ImgResult(BaseModel):
-    """协议 imgs[].img: 单个图像信息。
+class CardiacUltrasoundResult(BaseModel):
+    """心超源文件与其报告的关联。"""
 
-    方案 B (mentor 要求, 扩展协议): 每个 img 带独立 reportResult 字段。
-    ecgPredictions / ecgMeasurements / ecgPatientInfo 不在原协议中, ECG-FM 结构化
-    返回暂挂此处 (改进 #8), 待与后端对齐后调整。
-    """
-
-    imgId: str
-    imgType: str
+    dcmId: str
+    dcmPath: str
     reportId: str
-    rois: list[RoiSegment] = Field(default_factory=list)
-    reportResult: list[str] = Field(default_factory=list)
-    ecgPredictions: list[ECGPrediction] = Field(default_factory=list)
-    ecgMeasurements: Optional[ECGMeasurements] = None
-    ecgPatientInfo: Optional[ECGPatientInfo] = None
+    rois: list[Roi] = Field(default_factory=list)
 
 
-class ReportItem(BaseModel):
-    """协议 reports[]: 包裹层 {report: {...}}。"""
+class ECGResult(BaseModel):
+    """心电源文件与其报告的关联。"""
 
-    report: Report
-
-
-class ImgItemResult(BaseModel):
-    """协议 imgs[]: 包裹层 {img: {...}}。"""
-
-    img: ImgResult
+    ecgId: str
+    ecgPath: str
+    reportId: str
 
 
 class ResultResponse(BaseModel):
@@ -142,9 +181,12 @@ class ResultResponse(BaseModel):
     taskId: str
     taskState: int
     failedReason: Optional[str] = None
-    reports: list[ReportItem] = Field(default_factory=list)
-    imgs: list[ImgItemResult] = Field(default_factory=list)
+    reports: list[Report] = Field(default_factory=list)
+    cardiacUltrasound: list[CardiacUltrasoundResult] = Field(default_factory=list)
+    ecg: list[ECGResult] = Field(default_factory=list)
 
+
+# ────────────────── runner 协议 ──────────────────
 
 class InferenceRunner(Protocol):
     def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None) -> dict: ...
@@ -160,13 +202,14 @@ class FakeRunner:
         return dict(self._metrics)
 
 
+# ────────────────── 任务存储 ──────────────────
+
 class TaskStore:
     """内存任务存储。生产部署换 Redis/DB 支持多进程。
 
-    幂等规则 (同事建议 #8):
+    幂等规则:
       - 同 taskId 已存在: 返回已有状态, 不重复启动 (taskId 幂等)
       - 同 requestId 重发: 视为重复请求, 返回已有结果 (requestId 幂等)
-      - 同 taskId 不同 requestId: 视为覆盖, 重新创建任务
     """
 
     def __init__(self):
@@ -207,52 +250,66 @@ class TaskStore:
         self._tasks[task_id]["failedReason"] = reason
 
 
+# ────────────────── 请求展平 ──────────────────
+
+def _flatten_request(req: StartRequest) -> list[ImgItem]:
+    """将 v3 分组请求展平为 list[ImgItem], 供 runner 使用。
+
+    心超: dcmId→imgId, dcmPath→imgPath, imgType="Cardiac Ultrasound", dcmType 从 group 带下
+    ECG:  ecgId→imgId, ecgPath→imgPath, imgType="ECG", dcmType=None
+    """
+    imgs: list[ImgItem] = []
+    for group in req.cardiacUltrasound:
+        for dcm in group.dcms:
+            imgs.append(ImgItem(
+                imgId=dcm.dcmId, imgPath=dcm.dcmPath,
+                imgType="Cardiac Ultrasound", dcmType=group.dcmType,
+            ))
+    for ecg in req.ecg:
+        imgs.append(ImgItem(
+            imgId=ecg.ecgId, imgPath=ecg.ecgPath, imgType="ECG",
+        ))
+    return imgs
+
+
+# ────────────────── FastAPI app ──────────────────
+
 def create_app(
     runner: InferenceRunner,
     sync: bool = False,
     work_root: str | None = None,
+    store: TaskStore | None = None,
     ecgfm_health_check: Callable[[], dict] | None = None,
 ) -> FastAPI:
-    """
-    创建 FastAPI app。
+    """创建 FastAPI app。
 
     Args:
         runner: 推理器 (FakeRunner 测试 / CombinedRunner 生产)
         sync: True=start 同步执行 (测试用); False=BackgroundTasks 异步 (生产用)
         work_root: 任务产物根目录 (TASK_WORK_ROOT), 传给 runner 做任务隔离
-        ecgfm_health_check: ECG-FM 健康检查回调 (返回 status dict), 由 main.py 注入
-                           runner.health_check (实例级) 或 ECGFMRunner.health_check_from_env (静态)
+        store: 任务存储 (测试可注入; 默认内存 TaskStore)
+        ecgfm_health_check: ECG-FM 健康检查回调
     """
     app = FastAPI(title="心衰诊断算法服务")
     app.state.runner = runner
-    app.state.store = TaskStore()
+    app.state.store = store or TaskStore()
     app.state.sync = sync
     app.state.work_root = work_root
     app.state.ecgfm_health_check = ecgfm_health_check
 
     @app.get("/health")
     def health():
-        """健康检查端点 (阶段 1.3, 改进 #12)。
-
-        返回 ECG-FM 配置/文件/解释器状态, 不加载模型。
-        未注入 ecgfm_health_check 时返回 unconfigured。
-        """
+        """健康检查端点。"""
         if app.state.ecgfm_health_check is None:
-            ecgfm = {
-                "status": "unconfigured",
-                "errors": ["ECG-FM health check is not configured"],
-            }
+            ecgfm = {"status": "unconfigured", "errors": ["ECG-FM health check is not configured"]}
         else:
             ecgfm = app.state.ecgfm_health_check()
-        return {
-            "status": "ok" if ecgfm.get("status") == "healthy" else "degraded",
-            "ecgfm": ecgfm,
-        }
+        return {"status": "ok" if ecgfm.get("status") == "healthy" else "degraded", "ecgfm": ecgfm}
 
     @app.post("/heart-algo/task/start", response_model=StartResponse, response_model_exclude_none=True)
     def start(req: StartRequest, background_tasks: BackgroundTasks):
         store: TaskStore = app.state.store
-        # 幂等性检查 1: 同 requestId 重发 → 直接返回已有任务 (避免重复推理)
+        # 幂等性检查 1: 同 requestId 重发 → 直接返回已有任务
         if req.requestId:
             existing_by_req = store.get_by_request_id(req.requestId)
             if existing_by_req is not None:
@@ -264,9 +321,7 @@ def create_app(
                     taskId=existing_task_id,
                     taskState=existing_task["taskState"],
                 )
-        # 幂等性检查 2: 同 taskId 已存在 → 返回已有状态, 不重复启动
-        # - 已完成 (state=2) / 已失败 (state=3): 不重跑
-        # - 分析中 (state=1): 不重复启动 BackgroundTasks
+        # 幂等性检查 2: 同 taskId 已存在 → 返回已有状态
         existing = store.get(req.taskId)
         if existing is not None and existing["taskState"] in (1, 2, 3):
             return StartResponse(
@@ -277,17 +332,19 @@ def create_app(
                 taskState=existing["taskState"],
             )
 
-        store.create(req.taskId, req.imgs, request_id=req.requestId)
+        imgs = _flatten_request(req)
+        store.create(req.taskId, imgs, request_id=req.requestId)
         if app.state.sync:
-            _execute(app, req.taskId, req.imgs)
+            _execute(app, req.taskId, imgs)
         else:
-            background_tasks.add_task(_execute, app, req.taskId, req.imgs)
+            background_tasks.add_task(_execute, app, req.taskId, imgs)
 
         task = store.get(req.taskId)
+        is_failed = task["taskState"] == 3
         return StartResponse(
             responseId=req.requestId,
-            resultCode=0,
-            resultMsg="success" if task["taskState"] != 3 else task.get("failedReason", ""),
+            resultCode=1 if is_failed else 0,
+            resultMsg=task.get("failedReason", "") if is_failed else "success",
             taskId=req.taskId,
             taskState=task["taskState"],
         )
@@ -306,197 +363,119 @@ def create_app(
                 failedReason="task not found",
             )
 
+        is_failed = task["taskState"] == 3
         response = ResultResponse(
             responseId=req.requestId,
-            resultCode=0,
-            resultMsg="success",
+            resultCode=1 if is_failed else 0,
+            resultMsg=task["failedReason"] if is_failed else "success",
             taskId=req.taskId,
             taskState=task["taskState"],
             failedReason=task["failedReason"],
         )
         if task["taskState"] == 2 and task["result"] is not None:
-            result_data = task["result"]
-            response.reports = [ReportItem(
-                report=Report(
-                    reportId=req.taskId,
-                    reportResult=_report_lines(result_data),
-                )
-            )]
-            predictions = result_data.get("ecg_predictions", {})
-            measures = result_data.get("ecg_measurements", {})
-            patients = result_data.get("ecg_patient_info", {})
-            echo_per_image = result_data.get("echo_per_image", {})
-            response.imgs = [
-                ImgItemResult(
-                    img=ImgResult(
-                        imgId=image.imgId,
-                        imgType=image.imgType,
-                        reportId=req.taskId,
-                        rois=[
-                            RoiSegment(
-                                type=seg["type"],
-                                frameIndex=seg["frameIndex"],
-                                points=[RoiPoint(xPos=int(p[0]), yPos=int(p[1])) for p in seg["points"]],
-                            )
-                            for seg in echo_per_image.get(image.imgId, {}).get("rois", [])
-                        ],
-                        reportResult=_img_report_lines(image.imgId, image.imgType, result_data),
-                        ecgPredictions=[ECGPrediction(**item) for item in predictions.get(image.imgId, [])],
-                        ecgMeasurements=ECGMeasurements(**measures[image.imgId]) if image.imgId in measures else None,
-                        ecgPatientInfo=ECGPatientInfo(**patients[image.imgId]) if image.imgId in patients else None,
-                    )
-                )
-                for image in task["imgs"]
-            ]
+            _fill_result_payload(response, req.taskId, task["imgs"], task["result"])
         elif task["taskState"] == 3:
-            # 失败时: 心超图 reportResult 显示 "未分析", ECG 图返回空模型
-            reason = task["failedReason"] or "analysis failed"
-            response.reports = [ReportItem(
-                report=Report(reportId=req.taskId, reportResult=[f"分析失败: {reason}"])
-            )]
-            response.imgs = [
-                ImgItemResult(
-                    img=ImgResult(
-                        imgId=image.imgId,
-                        imgType=image.imgType,
-                        reportId=req.taskId,
-                        reportResult=[] if image.imgType == "ECG" else ["未分析"],
-                        ecgMeasurements=ECGMeasurements() if image.imgType == "ECG" else None,
-                        ecgPatientInfo=ECGPatientInfo() if image.imgType == "ECG" else None,
-                    )
-                )
-                for image in task["imgs"]
-            ]
+            _fill_failure_payload(response, req.taskId, task["imgs"], task["failedReason"])
         return response
 
     return app
 
 
-def _img_report_lines(img_id: str, img_type: str, result: dict) -> list[str]:
-    """方案 B (mentor 要求): 单个图像的独立推理报告行。
+# ────────────────── 响应组装 ──────────────────
 
-    心超 (Cardiac Ultrasound): 从 echo_per_image[imgId] 取指标, 生成 1 行指标文本
-    ECG: 从 ecg_measurements/ecg_patient_info/ecg_predictions[imgId] 生成 3 行
-        - ECG patient: 姓名/性别/年龄
-        - ECG measurements: HR/PR/QRS/QT/QTc/电轴
-        - ECG disease probability Top-K
-    """
-    lines: list[str] = []
-    if img_type == "Cardiac Ultrasound":
-        per_img = result.get("echo_per_image", {}).get(img_id, {})
-        # 阶段 2: 单图推理失败 → 返回错误信息
-        if per_img.get("error"):
-            return [f"分析失败: {per_img['error']}"]
-        parts = []
-        if per_img.get("lvef") is not None:
-            parts.append(f"LVEF={per_img['lvef']}%")
-        if per_img.get("lvedd") is not None:
-            parts.append(f"LVEDD={per_img['lvedd']}mm")
-        if per_img.get("lvesd") is not None:
-            parts.append(f"LVESD={per_img['lvesd']}mm")
-        if per_img.get("lad") is not None:
-            parts.append(f"LAD={per_img['lad']}mm")
-        if per_img.get("ea") is not None:
-            parts.append(f"E/A={per_img['ea']}")
-        if per_img.get("gls") is not None:
-            parts.append(f"GLS={per_img['gls']}")
-        if parts:
-            lines.append(", ".join(parts))
-        else:
-            # 无任何指标 (单帧 skip 图 / 未跑推理) → 标记未分析
-            lines.append("未分析")
-    elif img_type == "ECG":
-        # 患者信息行
-        patient = result.get("ecg_patient_info", {}).get(img_id, {})
-        if patient:
-            name = patient.get("name") or "未知"
-            age = patient.get("age")
-            sex = patient.get("sex") or "未知"
-            age_str = f"{age}岁" if age is not None else "年龄未知"
-            sex_zh = {"M": "男", "F": "女"}.get(sex, sex)
-            lines.append(f"ECG patient ({img_id}): {name}, {sex_zh}, {age_str}")
-        # 测量值行
-        m = result.get("ecg_measurements", {}).get(img_id, {})
-        if m:
-            parts = []
-            if "ventRate" in m:
-                parts.append(f"HR={m['ventRate']}bpm")
-            if "prInterval" in m:
-                parts.append(f"PR={m['prInterval']}ms")
-            if "qrsDuration" in m:
-                parts.append(f"QRS={m['qrsDuration']}ms")
-            if "qt" in m:
-                parts.append(f"QT={m['qt']}ms")
-            if "qtc" in m:
-                parts.append(f"QTc={m['qtc']}ms")
-            if "pAxis" in m:
-                parts.append(f"P轴={m['pAxis']}")
-            if "qrsAxis" in m:
-                parts.append(f"QRS轴={m['qrsAxis']}")
-            if "tAxis" in m:
-                parts.append(f"T轴={m['tAxis']}")
-            if parts:
-                lines.append(f"ECG measurements ({img_id}): {', '.join(parts)}")
-        # Top-K 行
-        predictions = result.get("ecg_predictions", {}).get(img_id, [])
-        if predictions:
-            top_k = ", ".join(
-                f"{item['label']}={item['probability']:.2%}" for item in predictions
-            )
-            lines.append(f"ECG disease probability Top-K ({img_id}): {top_k}")
-    return lines
+def _json_report(payload: dict) -> str:
+    """将结构化模型结果序列化为接口要求的 JSON 字符串。"""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _report_lines(result: dict) -> list[str]:
-    """生成报告文本行: 心超分型 + 指标 + ECG 患者信息 + 测量值 + Top-K。"""
-    lines: list[str] = []
-    if result.get("has_echo"):
-        lines.extend([
-            f"Heart failure type: {result.get('hf_type', 'unknown')}",
-            "LVEF={lvef}%, LVEDD={lvedd}mm, LVESD={lvesd}mm, LAD={lad}mm, E/A={ea}, GLS={gls}".format(**result),
-        ])
-    # ECG 患者信息 + 测量值 (同事贡献: parse_ecg_xml 提取)
-    for image_id, patient in result.get("ecg_patient_info", {}).items():
-        if not patient:
-            continue
-        name = patient.get("name") or "未知"
-        age = patient.get("age")
-        sex = patient.get("sex") or "未知"
-        age_str = f"{age}岁" if age is not None else "年龄未知"
-        sex_zh = {"M": "男", "F": "女"}.get(sex, sex)
-        lines.append(f"ECG patient ({image_id}): {name}, {sex_zh}, {age_str}")
-    for image_id, m in result.get("ecg_measurements", {}).items():
-        if not m:
-            continue
-        # ventRate/prInterval/qrsDuration/qt/qtc/pAxis/qrsAxis/tAxis
-        parts = []
-        if "ventRate" in m:
-            parts.append(f"HR={m['ventRate']}bpm")
-        if "prInterval" in m:
-            parts.append(f"PR={m['prInterval']}ms")
-        if "qrsDuration" in m:
-            parts.append(f"QRS={m['qrsDuration']}ms")
-        if "qt" in m:
-            parts.append(f"QT={m['qt']}ms")
-        if "qtc" in m:
-            parts.append(f"QTc={m['qtc']}ms")
-        if "pAxis" in m:
-            parts.append(f"P轴={m['pAxis']}")
-        if "qrsAxis" in m:
-            parts.append(f"QRS轴={m['qrsAxis']}")
-        if "tAxis" in m:
-            parts.append(f"T轴={m['tAxis']}")
-        if parts:
-            lines.append(f"ECG measurements ({image_id}): {', '.join(parts)}")
-    for image_id, predictions in result.get("ecg_predictions", {}).items():
-        if not predictions:
-            continue
-        top_k = ", ".join(
-            f"{item['label']}={item['probability']:.2%}" for item in predictions
+def _echo_rois(result: dict, img_id: str) -> list[Roi]:
+    """将推理器的心超 ROI 转换为对外协议字段。"""
+    segments = result.get("echo_per_image", {}).get(img_id, {}).get("rois", [])
+    return [
+        Roi(
+            roiType=segment["type"],
+            points=[RoiPoint(xPos=int(point[0]), yPos=int(point[1])) for point in segment["points"]],
         )
-        lines.append(f"ECG disease probability Top-K ({image_id}): {top_k}")
-    return lines or ["No analyzable cardiac-ultrasound or ECG result was produced."]
+        for segment in segments
+    ]
 
+
+def _fill_result_payload(response: ResultResponse, task_id: str, images: list[ImgItem], result: dict) -> None:
+    """按 ECG 与心超两类文件组装完成任务的响应。"""
+    for image in images:
+        if image.imgType == "ECG":
+            report_id = f"{task_id}:{image.imgId}:ecg"
+            payload = {
+                "ecgId": image.imgId,
+                "patientInfo": result.get("ecg_patient_info", {}).get(image.imgId, {}),
+                "measurements": result.get("ecg_measurements", {}).get(image.imgId, {}),
+                "predictions": result.get("ecg_predictions", {}).get(image.imgId, []),
+            }
+            response.reports.append(Report(reportId=report_id, reportType="ECGFM", reportResult=_json_report(payload)))
+            response.ecg.append(ECGResult(ecgId=image.imgId, ecgPath=image.imgPath, reportId=report_id))
+        elif image.imgType == "Cardiac Ultrasound":
+            report_id = f"{task_id}:{image.imgId}:measurement"
+            per_image = result.get("echo_per_image", {}).get(image.imgId, {})
+            if not per_image:
+                per_image = {
+                    key: result[key]
+                    for key in ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "hf_type")
+                    if key in result
+                }
+            # measurements 带中文名/单位/参考范围
+            measurements: dict = {}
+            for key, value in per_image.items():
+                if key in {"rois", "error", "skipReason"}:
+                    continue
+                meta = METRIC_META.get(key)
+                if meta:
+                    measurements[key] = {"value": value, **meta}
+                else:
+                    measurements[key] = {"value": value}
+            payload = {
+                "dcmId": image.imgId,
+                "measurements": measurements,
+            }
+            if per_image.get("skipReason"):
+                payload["skipReason"] = per_image["skipReason"]
+            if per_image.get("error"):
+                payload["error"] = per_image["error"]
+            response.reports.append(Report(reportId=report_id, reportType="MEASUREMENT", reportResult=_json_report(payload)))
+            response.cardiacUltrasound.append(CardiacUltrasoundResult(
+                dcmId=image.imgId,
+                dcmPath=image.imgPath,
+                reportId=report_id,
+                rois=_echo_rois(result, image.imgId),
+            ))
+
+
+def _fill_failure_payload(response: ResultResponse, task_id: str, images: list[ImgItem], reason: str | None) -> None:
+    """失败任务仍按文件返回可关联的报告, 具体原因在 JSON 和 failedReason 中均可取得。"""
+    failure_reason = reason or "analysis failed"
+    for image in images:
+        if image.imgType == "ECG":
+            report_id = f"{task_id}:{image.imgId}:ecg"
+            response.reports.append(Report(
+                reportId=report_id,
+                reportType="ECGFM",
+                reportResult=_json_report({"ecgId": image.imgId, "error": failure_reason}),
+            ))
+            response.ecg.append(ECGResult(ecgId=image.imgId, ecgPath=image.imgPath, reportId=report_id))
+        elif image.imgType == "Cardiac Ultrasound":
+            report_id = f"{task_id}:{image.imgId}:measurement"
+            response.reports.append(Report(
+                reportId=report_id,
+                reportType="MEASUREMENT",
+                reportResult=_json_report({"dcmId": image.imgId, "error": failure_reason}),
+            ))
+            response.cardiacUltrasound.append(CardiacUltrasoundResult(
+                dcmId=image.imgId,
+                dcmPath=image.imgPath,
+                reportId=report_id,
+            ))
+
+
+# ────────────────── 任务执行 ──────────────────
 
 def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
     """执行推理并更新任务状态。ECG-only 任务不强求心超指标。"""
@@ -505,7 +484,7 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
     work_root: str | None = getattr(app.state, "work_root", None)
     try:
         raw_result = runner.run(imgs, task_id=task_id, work_root=work_root)
-        echo_keys = ("lvef", "lvedd", "lvesd", "lad", "ea", "gls")
+        echo_keys = ("lvef", "lvedd", "lvesd", "lad", "mv_ea")
         has_echo = any(key in raw_result for key in echo_keys)
         result: dict = {
             "has_echo": has_echo,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 
 class ECGFMConfigError(RuntimeError):
@@ -40,6 +41,17 @@ class ECGFMConfig:
     python_executable: Path
     top_k: int = 5
     timeout_seconds: int = 300
+
+    # ECG-FM 项目根目录: 需包含 XML 转换和推理脚本。
+    DEFAULT_PROJECT_DIR: ClassVar[Path] = Path(r"G:\ecg-fm\ecg-fm\ecg-fm")
+    # ECG-FM 微调权重文件路径。
+    DEFAULT_CHECKPOINT: ClassVar[Path] = Path(r"G:\ecg-fm\ecg-fm\weights\mimic_iv_ecg_finetuned.pt")
+    # ECG-FM 专用 Python 解释器路径。
+    DEFAULT_PYTHON_EXECUTABLE: ClassVar[Path] = Path(r"C:\Users\Administrator\miniconda3\envs\ecg_env\python.exe")
+    # ECG 返回概率最高的标签数量。
+    DEFAULT_TOP_K: ClassVar[int] = 5
+    # ECG 单阶段转换或推理超时秒数。
+    DEFAULT_TIMEOUT_SECONDS: ClassVar[int] = 300
 
     @classmethod
     def from_env(cls) -> "ECGFMConfig":
@@ -123,3 +135,57 @@ class ECGFMConfig:
         if value < 1:
             raise ECGFMConfigError(f"{name} must be greater than 0, got: {value}")
         return value
+
+
+@dataclass(frozen=True)
+class MeasurementConfig:
+    """Measurement 心超模型配置。
+
+    两种构造方式:
+      - resolve(): 从 CLI 参数构造, 未传入时使用默认值 (不读环境变量)
+      - 直接实例化: 传入 script_dir 和 python_executable
+    """
+
+    script_dir: Path
+    python_executable: str
+
+    # Measurement 项目目录: 需包含心超推理脚本 (inference_2D_image.py 等)
+    DEFAULT_SCRIPT_DIR: ClassVar[Path] = Path(r"G:\meaurements\measurements\Measurement")
+    # Measurement 推理使用的 Python 解释器
+    DEFAULT_PYTHON_EXECUTABLE: ClassVar[str] = "python"
+
+    @classmethod
+    def resolve(cls, *, script_dir: str | Path | None = None,
+                python_executable: str | None = None) -> "MeasurementConfig":
+        """使用 CLI 覆盖值; 未传入时返回本文件默认配置。"""
+        return cls(Path(script_dir).expanduser() if script_dir else cls.DEFAULT_SCRIPT_DIR,
+                   python_executable or cls.DEFAULT_PYTHON_EXECUTABLE)
+
+
+class ProductionConfigError(RuntimeError):
+    """生产部署配置无效时抛出。"""
+
+
+@dataclass(frozen=True)
+class ProductionSettings:
+    """MySQL、Redis、共享存储和 GPU 的占位生产配置。"""
+    database_url: str
+    redis_url: str
+    queue_name: str
+    task_work_root: str
+    gpu_slots_per_device: int = 1
+
+    DEFAULT_DATABASE_URL: ClassVar[str] = "mysql+pymysql://<db_user>:<db_password>@<db_host>:3306/<db_name>?charset=utf8mb4"
+    DEFAULT_REDIS_URL: ClassVar[str] = "redis://:<redis_password>@<redis_host>:6379/0"
+    DEFAULT_QUEUE_NAME: ClassVar[str] = "heart_algo_gpu"
+    DEFAULT_TASK_WORK_ROOT: ClassVar[str] = r"<shared_storage_root>\runtime"
+
+    @classmethod
+    def resolve(cls, *, database_url: str | None = None, redis_url: str | None = None,
+                queue_name: str | None = None, task_work_root: str | None = None,
+                gpu_slots_per_device: int | None = None) -> "ProductionSettings":
+        slots = 1 if gpu_slots_per_device is None else int(gpu_slots_per_device)
+        if slots < 1:
+            raise ProductionConfigError("单卡并发任务数必须大于 0")
+        return cls(database_url or cls.DEFAULT_DATABASE_URL, redis_url or cls.DEFAULT_REDIS_URL,
+                   queue_name or cls.DEFAULT_QUEUE_NAME, task_work_root or cls.DEFAULT_TASK_WORK_ROOT, slots)
