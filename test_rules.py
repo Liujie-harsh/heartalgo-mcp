@@ -5,7 +5,9 @@
   1. HF 分型: 由 LVEF 阈值决定 (HFrEF <40 / HFmrEF 40-49 / HFpEF ≥50)
   2. 6 项指标异常标红: 按 handoff 参考范围判定
   3. GLS=null: 不标红, 标注"未测量"
-  4. 接口契约: analyze() 返回 {lvef, lvedd, lvesd, lad, ea, gls}
+  4. 接口契约: analyze() 返回 {lvef, lvedd, lvesd, lad, ea, mv_ea, gls, hf_type}
+  5. v3 兼容: ea → mv_ea 字段名统一, 两者同时返回 (向后兼容)
+  6. 阶段 2 容错: lvef=None → hf_type="未知" (所有 2D 图失败时不抛异常)
 
 参考范围 (handoff.md L25-L32):
   LVEF  ≥50%        <50 标红
@@ -42,6 +44,10 @@ class TestClassifyHF:
 
     def test_lvef_65_is_hfpef(self):
         assert classify_hf(lvef=65) == "HFpEF"
+
+    def test_lvef_none_returns_unknown(self):
+        # 阶段 2 容错: 所有 2D 图失败时 lvef=None → "未知" (不抛 TypeError)
+        assert classify_hf(lvef=None) == "未知"
 
 
 # ────────────────── 指标异常标红 ──────────────────
@@ -80,6 +86,13 @@ class TestFlagAbnormal:
     def test_ea_above_15_is_abnormal(self):
         assert flag_abnormal("E/A", 2.02) is True
 
+    def test_mv_ea_within_08_15_is_normal(self):
+        # v3: MV_EA 与 E/A 共用参考范围
+        assert flag_abnormal("MV_EA", 1.2) is False
+
+    def test_mv_ea_above_15_is_abnormal(self):
+        assert flag_abnormal("MV_EA", 2.02) is True
+
     def test_gls_above_minus16_is_abnormal(self):
         # GLS > -16 标红 (如 -12 大于 -16)
         assert flag_abnormal("GLS", -12) is True
@@ -112,3 +125,56 @@ class TestAnalyzeContract:
         # 报告需输出心衰分型诊断
         result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02, gls=None)
         assert result["hf_type"] == "HFrEF"
+
+
+# ────────────────── v3 mv_ea 字段兼容 ──────────────────
+
+class TestAnalyzeMvEa:
+    """v3: ea → mv_ea 字段名统一, analyze() 同时返回两者 (向后兼容)。"""
+
+    def test_mv_ea_param_populates_both_keys(self):
+        # v3: 传 mv_ea 参数 → ea 和 mv_ea 都有值
+        result = analyze(lvef=50.0, lvedd=50.0, lvesd=30.0, lad=35.0, mv_ea=1.2)
+        assert result["mv_ea"] == 1.2
+        assert result["ea"] == 1.2
+
+    def test_ea_param_still_works(self):
+        # 旧接口: 传 ea 参数 → ea 和 mv_ea 都有值
+        result = analyze(lvef=50.0, lvedd=50.0, lvesd=30.0, lad=35.0, ea=1.2)
+        assert result["ea"] == 1.2
+        assert result["mv_ea"] == 1.2
+
+    def test_mv_ea_takes_priority_over_ea(self):
+        # 同时传 ea 和 mv_ea → mv_ea 优先
+        result = analyze(lvef=50.0, lvedd=50.0, lvesd=30.0, lad=35.0, ea=1.0, mv_ea=2.0)
+        assert result["mv_ea"] == 2.0
+        assert result["ea"] == 2.0
+
+    def test_mv_ea_none_falls_back_to_ea(self):
+        # mv_ea=None, ea=1.5 → 使用 ea
+        result = analyze(lvef=50.0, lvedd=50.0, lvesd=30.0, lad=35.0, ea=1.5, mv_ea=None)
+        assert result["mv_ea"] == 1.5
+        assert result["ea"] == 1.5
+
+    def test_both_none_returns_none(self):
+        # 都不传 → ea=None, mv_ea=None
+        result = analyze(lvef=50.0, lvedd=50.0, lvesd=30.0, lad=35.0)
+        assert result["ea"] is None
+        assert result["mv_ea"] is None
+
+
+# ────────────────── 阶段 2: lvef=None 容错 ──────────────────
+
+class TestAnalyzeLvefNone:
+    """阶段 2: 所有 2D 图失败时 lvef=None, analyze() 不抛异常, hf_type="未知"。"""
+
+    def test_lvef_none_returns_unknown_hf_type(self):
+        result = analyze(lvef=None, lvedd=None, lvesd=None, lad=None, mv_ea=None)
+        assert result["hf_type"] == "未知"
+
+    def test_lvef_none_preserves_other_metrics(self):
+        # lvef=None 但其他指标有值 → hf_type="未知", 其他指标原样返回
+        result = analyze(lvef=None, lvedd=55.0, lvesd=40.0, lad=35.0, mv_ea=2.02)
+        assert result["hf_type"] == "未知"
+        assert result["lvedd"] == 55.0
+        assert result["mv_ea"] == 2.02

@@ -9,3 +9,6 @@ build/
 .venv/
 venv/
 *.egg
+
+# 基础设施敏感配置（含密码）
+database/.env.infrastructure

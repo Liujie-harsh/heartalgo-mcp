@@ -136,8 +136,6 @@ def teichholz_lvef(edd_mm: float, esd_mm: float) -> float:
 
 # ────────────────── 真实推理 runner ──────────────────
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
 
 class EchoNetRunner:
     """生产推理器: 按 dcmType 查 DCM_TYPE_TASKS 表分流推理。"""
@@ -150,13 +148,13 @@ class EchoNetRunner:
         python_executable: str | None = None,
     ):
         self.config = config or MeasurementConfig.resolve(
-            script_dir=script_dir or SCRIPT_DIR,
+            script_dir=script_dir,
             python_executable=python_executable,
         )
         self.script_dir = str(self.config.script_dir)
         self.python_executable = self.config.python_executable
 
-    def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None) -> dict:
+    def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None, gpu_device: str | None = None) -> dict:
         """
         按 img.dcmType 查 DCM_TYPE_TASKS 表分流推理。
 
@@ -166,7 +164,7 @@ class EchoNetRunner:
 
         PLAX 内部依赖: LVID 必须第一个跑, 产出 ED/ES 帧号供 IVS/LVPW 的 ed_frame 规则使用。
         """
-        echo_files = [img for img in imgs if img.imgType == "Cardiac Ultrasound"]
+        echo_files = [img for img in imgs if img.imgType == "CARDIAC_ULTRASOUND"]
         per_image: dict[str, dict] = {}
 
         # 顶层主指标 (供 rules.analyze)
@@ -188,7 +186,7 @@ class EchoNetRunner:
             try:
                 for task in tasks:
                     metric = task["metric"]
-                    csv_path, stdout = self._run_task(task, img.imgPath, img.imgId, task_id, work_root)
+                    csv_path, stdout = self._run_task(task, img.imgPath, img.imgId, task_id, work_root, gpu_device)
                     value, rois = self._parse_by_rule(
                         task["value_rule"], metric, csv_path, stdout, ed_idx, es_idx,
                     )
@@ -233,7 +231,7 @@ class EchoNetRunner:
 
     # ────────────────── 通用推理调度 ──────────────────
 
-    def _run_task(self, task: dict, dcm_path: str, img_id: str, task_id: str, work_root: str | None) -> tuple:
+    def _run_task(self, task: dict, dcm_path: str, img_id: str, task_id: str, work_root: str | None, gpu_device: str | None = None) -> tuple:
         """执行单个推理任务, 返回 (csv_path, stdout)。
 
         输出目录: <work_root>/<task_id>/outputs/<img_id>/echo/<weights或metric>/
@@ -252,7 +250,7 @@ class EchoNetRunner:
         cmd += task["extra"]
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.script_dir)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.script_dir, env={**os.environ, **({"CUDA_VISIBLE_DEVICES": str(gpu_device)} if gpu_device is not None else {})})
         except subprocess.CalledProcessError as e:
             stderr_tail = (e.stderr or "")[-500:]
             raise RuntimeError(f"脚本 {task['script']} 退出码={e.returncode}, stderr: {stderr_tail}") from e

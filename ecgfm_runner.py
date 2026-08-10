@@ -1,4 +1,4 @@
-"""ECG-FM XML inference adapter for the cardiac task API.
+﻿"""ECG-FM XML inference adapter for the cardiac task API.
 
 输入: HL7 aECG XML 信号文件 (前端传 XML)
 流程: XML → parse_ecg_xml 解析测量值+患者信息 → xml_to_ecgfm_mat.py 转 MAT
@@ -8,17 +8,17 @@
   work_root/task_id/outputs/<imgId>/ecg/{mat,output}/...
   产物永久保留, 不自动清理 (handoff L527 决策)。
 
-同事贡献 (合并自 algorithm_merged/ecgfm_runner.py):
+合并自 algorithm_merged/ecgfm_runner.py:
   - parse_ecg_xml: 解析 HL7 aECG XML 提取 8 项测量值 + 患者信息
   - LABELS_ZH: 18 个疾病标签英文→中文映射
   - ecg_measurements / ecg_patient_info: 结构化返回 (改进 #8)
   - safe_task / safe_img: taskId/imgId 路径 sanitize
-  - health_check_from_env: 静态健康检查 (读环境变量)
   - 多 ECG 拒绝: 每任务仅允许 1 个 ECG (handoff L300)
   - _cmd stderr 透传: 子进程失败时把 stderr 透传到 ValueError
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -34,7 +34,23 @@ from api import ImgItem
 from config import ECGFMConfig
 
 
-# ECG-FM 疾病标签英文 → 中文 (同事贡献)
+class ECGInputError(ValueError):
+    """ECG XML 文件或其波形数据不符合模型输入要求。"""
+
+
+class ECGConversionError(RuntimeError):
+    """ECG XML 转换为 ECG-FM MAT 文件失败。"""
+
+
+class ECGInferenceError(RuntimeError):
+    """ECG-FM 未产生可用的预测结果。"""
+
+
+class ECGTimeoutError(TimeoutError):
+    """ECG 数据转换或模型推理超过时间限制。"""
+
+
+# ECG-FM 疾病标签英文 → 中文
 LABELS_ZH = {
     "Poor data quality": "数据质量差",
     "Sinus rhythm": "窦性心律",
@@ -55,7 +71,7 @@ LABELS_ZH = {
     "Bifascicular block": "双分支传导阻滞",
 }
 
-# HL7 aECG XML annotation code → 测量字段名 (同事贡献)
+# HL7 aECG XML annotation code → 测量字段名
 CODES = {
     "MDC_ECG_HEART_RATE": "ventRate",
     "MDC_ECG_TIME_PD_PR": "prInterval",
@@ -100,21 +116,19 @@ def parse_ecg_xml(xml_path: Path) -> tuple[dict, dict]:
     Returns:
         (measurements, patient_info)
         measurements: {ventRate, prInterval, qrsDuration, qt, qtc, pAxis, qrsAxis, tAxis}
-        patient_info: {name, age, sex}
+        patient_info: {patientId, age, sex}
     """
     root = ET.parse(xml_path).getroot()
     m = {}
-    family = next((e for e in root.iter() if _name(e) == "family"), None)
-    given = next((e for e in root.iter() if _name(e) == "given"), None)
+    # 取 XML 中首个带 extension 的业务 ID；后续 extension="0" 为设备序列 ID，不作为患者标识。
+    patient_id = next((e.get("extension") for e in root.iter()
+                       if _name(e) == "id" and e.get("extension")), None)
     gender = next((e for e in root.iter() if _name(e) == "administrativeGenderCode"), None)
     birth = next((e for e in root.iter() if _name(e) == "birthTime"), None)
     exam = next((e for e in root.iter() if _name(e) == "effectiveTime"), None)
     low = _child(exam, "low") if exam is not None else None
     patient = {
-        "name": " ".join(x for x in [
-            ((family.text or "").strip() if family is not None else ""),
-            ((given.text or "").strip() if given is not None else ""),
-        ] if x) or None,
+        "patientId": patient_id,
         "age": _age(birth.get("value") if birth is not None else None,
                     low.get("value") if low is not None else None),
         "sex": gender.get("code") if gender is not None else None,
@@ -170,43 +184,7 @@ class ECGFMRunner:
         self.top_k = config.top_k
         self.timeout_seconds = config.timeout_seconds
 
-    def health_check(self) -> dict:
-        """实例级健康检查: 读 self.config 而非 os.environ (Q1 决策)。
-
-        与 health_check_from_env 的差异: 配置已绑定到 runner 实例, 不依赖环境变量。
-        main.py 应传 runner.health_check 给 create_app 的 ecgfm_health_check 参数。
-        """
-        return _check_ecgfm_files(
-            project_dir=self.config.project_dir,
-            checkpoint=self.config.checkpoint,
-            python_executable=self.config.python_executable,
-        )
-
-    @staticmethod
-    def health_check_from_env() -> dict:
-        """静态健康检查: 读 ECGFM_* 环境变量 (兼容 test_ecgfm_health.py)。
-
-        Deprecated: 优先用实例级 health_check()。保留此方法仅为兼容旧测试和
-        未注入 runner 的场景 (如独立诊断脚本)。
-        """
-        project_raw = os.environ.get("ECGFM_PROJECT_DIR", "")
-        checkpoint_raw = os.environ.get("ECGFM_CHECKPOINT", "")
-        python_raw = os.environ.get("ECGFM_PYTHON", "")
-        project_dir = Path(project_raw) if project_raw else None
-        checkpoint = Path(checkpoint_raw) if checkpoint_raw else None
-        python_executable = Path(python_raw) if python_raw else None
-        result = _check_ecgfm_files(
-            project_dir=project_dir,
-            checkpoint=checkpoint,
-            python_executable=python_executable,
-        )
-        # 增补 "是否已配置" 字段 (env 工作流需要区分未配置 vs 配置错)
-        result["projectDirConfigured"] = bool(project_raw)
-        result["checkpointConfigured"] = bool(checkpoint_raw)
-        result["pythonConfigured"] = bool(python_raw)
-        return result
-
-    def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None) -> dict:
+    def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None, gpu_device: str | None = None) -> dict:
         """返回 {ecg_predictions, ecg_measurements, ecg_patient_info}。
 
         每项都是 {imgId: ...} 结构。
@@ -225,7 +203,7 @@ class ECGFMRunner:
                 "ecg_measurements": measurements,
                 "ecg_patient_info": patient_info,
             }
-        # 多 ECG 拒绝 (同事贡献, handoff L300)
+        # 多 ECG 拒绝
         if len(ecg) != 1:
             raise ValueError("ECG-FM requires exactly one ECG image per task")
         self._validate_configuration()
@@ -235,11 +213,19 @@ class ECGFMRunner:
 
         for image in ecg:
             source = Path(image.imgPath)
-            if source.suffix.lower() != ".xml" or not source.is_file():
-                raise FileNotFoundError(f"ECG XML file not found or invalid: {source}")
-            # 同步解析 XML 测量值 + 患者信息 (同事贡献)
-            measurements[image.imgId], patient_info[image.imgId] = parse_ecg_xml(source)
-            predictions[image.imgId] = self._run_one(source, image.imgId, task_id, effective_root)
+            if source.suffix.lower() != ".xml":
+                raise ECGInputError("ECG 输入文件格式不支持：仅支持 XML 文件")
+            if not source.is_file():
+                raise ECGInputError(f"ECG 输入文件不存在：{source}")
+            # 缺少测量/患者标签不是失败；解析成功时按 {} / null 返回。
+            try:
+                measurements[image.imgId], patient_info[image.imgId] = parse_ecg_xml(source)
+            except ET.ParseError as error:
+                line, column = error.position
+                raise ECGInputError(f"ECG XML 格式错误（第 {line} 行，第 {column} 列）") from error
+            except (TypeError, ValueError) as error:
+                raise ECGInputError("ECG XML 测量数据格式错误") from error
+            predictions[image.imgId] = self._run_one(source, image.imgId, task_id, effective_root, gpu_device)
         return {
             "ecg_predictions": predictions,
             "ecg_measurements": measurements,
@@ -255,13 +241,13 @@ class ECGFMRunner:
         if self.top_k < 1:
             raise ValueError("top_k must be at least 1")
 
-    def _run_one(self, xml_path: Path, img_id: str = "", task_id: str = "", work_root: str | None = None) -> list[dict]:
+    def _run_one(self, xml_path: Path, img_id: str = "", task_id: str = "", work_root: str | None = None, gpu_device: str | None = None) -> list[dict]:
         converter = self.project_dir / "scripts" / "xml_to_ecgfm_mat.py"
         inference = self.project_dir / "scripts" / "infer_quickstart.py"
 
         # 任务隔离目录: <work_root>/<task_id>/outputs/<img_id>/ecg/
         # work_root 或 task_id 缺失时 fallback 到系统 temp (不隔离, 仅开发用)
-        # safe_task / safe_img: taskId/imgId 含非法路径字符时替换为 _ (同事贡献)
+        # safe_task / safe_img: taskId/imgId 含非法路径字符时替换为 _
         if work_root and task_id:
             safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id).strip("._")
             safe_img = re.sub(r"[^A-Za-z0-9_.-]", "_", img_id).strip("._") or "ecg"
@@ -280,97 +266,62 @@ class ECGFMRunner:
         mat_path.parent.mkdir(parents=True, exist_ok=True)
         output_dir = task_dir / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
-        self._run_command([str(self.python_executable), str(converter), str(xml_path), str(mat_path)], timeout=self.timeout_seconds)
+        self._run_command([str(self.python_executable), str(converter), str(xml_path), str(mat_path)], timeout=self.timeout_seconds, stage="数据转换", gpu_device=gpu_device)
         self._run_command([
             str(self.python_executable), str(inference), str(mat_path),
             "--output-dir", str(output_dir),
             "--checkpoint", str(self.checkpoint),
-        ], timeout=self.timeout_seconds)
+        ], timeout=self.timeout_seconds, gpu_device=gpu_device)
         return self._read_top_k(output_dir / "predictions_aggregated.csv")
 
     @staticmethod
-    def _run_command(command: list[str], timeout: int = 300) -> None:
-        """运行子进程, 超时抛 subprocess.TimeoutExpired (被 _execute 捕获 → taskState=3)。
+    def _conversion_error_message(detail: str) -> str:
+        """将转换器可识别的输入错误翻译为面向 API 的中文失败原因。"""
+        marker = "Missing long rhythm leads:"
+        if marker in detail:
+            leads = detail.split(marker, 1)[1].splitlines()[0].strip()
+            return f"ECG 输入不完整：缺少十二导联长节律信号（{leads.replace(', ', '、')}）"
+        if "Lead lengths do not match" in detail:
+            return "ECG 输入不完整：十二导联采样点数量不一致"
+        if "No sample interval found" in detail:
+            return "ECG 输入不完整：采样率缺失或不合法"
+        return "ECG 数据转换失败"
 
-        子进程失败时把 stderr 透传到 ValueError (同事贡献, 比 CalledProcessError 更友好)。
-        """
+    @staticmethod
+    def _run_command(command: list[str], timeout: int = 300, stage: str = "模型推理", gpu_device: str | None = None) -> None:
+        """运行 ECG 子进程，转换为稳定的业务异常，不向 API 暴露 stderr。"""
         try:
-            subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout, env={**os.environ, **({"CUDA_VISIBLE_DEVICES": str(gpu_device)} if gpu_device is not None else {})})
+        except subprocess.TimeoutExpired as error:
+            raise ECGTimeoutError(f"ECG {stage}超时（超过 {timeout} 秒）") from error
         except subprocess.CalledProcessError as error:
             detail = (error.stderr or error.stdout or "").strip()
-            if detail:
-                raise ValueError(f"ECG-FM command failed: {detail}") from error
-            raise ValueError(f"ECG-FM command failed with exit code {error.returncode}") from error
+            if stage == "数据转换":
+                raise ECGConversionError(ECGFMRunner._conversion_error_message(detail)) from error
+            raise ECGInferenceError("ECG 模型推理失败") from error
 
     def _read_top_k(self, csv_path: Path) -> list[dict]:
-        """读 CSV 取 Top-K, 标签中文化 (同事贡献)。"""
+        """读取 CSV，校验有效概率后返回中文标签 Top-K。"""
         if not csv_path.is_file():
-            raise FileNotFoundError(f"ECG-FM did not produce aggregated predictions: {csv_path}")
-        data = pd.read_csv(csv_path, index_col=0)
+            raise ECGInferenceError("ECG 模型未返回预测结果文件")
+        try:
+            data = pd.read_csv(csv_path, index_col=0)
+        except (OSError, UnicodeError, pd.errors.EmptyDataError, pd.errors.ParserError) as error:
+            raise ECGInferenceError("ECG 模型未返回有效预测结果") from error
+        if data.empty:
+            raise ECGInferenceError("ECG 模型未返回有效预测结果")
         if len(data.index) != 1:
-            raise ValueError(f"Expected one ECG-FM prediction row, got {len(data.index)}")
-        values = data.iloc[0].astype(float).sort_values(ascending=False).head(self.top_k)
+            raise ECGInferenceError(f"ECG 模型预测结果行数异常：期望 1 行，实际 {len(data.index)} 行")
+
+        numeric_values = pd.to_numeric(data.iloc[0], errors="coerce")
+        valid_values = numeric_values[
+            numeric_values.map(lambda value: pd.notna(value) and math.isfinite(float(value)))
+        ]
+        if valid_values.empty:
+            raise ECGInferenceError("ECG 模型预测概率为空或无效")
+
+        values = valid_values.sort_values(ascending=False).head(self.top_k)
         return [
             {"label": LABELS_ZH.get(str(label), str(label)), "probability": round(float(probability), 6)}
             for label, probability in values.items()
         ]
-
-
-def _check_ecgfm_files(
-    project_dir: Path | None,
-    checkpoint: Path | None,
-    python_executable: Path | None,
-) -> dict:
-    """检查 ECG-FM 文件和解释器, 不导入也不加载模型 (供实例/静态 health_check 共用)。
-
-    Args:
-        project_dir / checkpoint / python_executable: 已解析的 Path 或 None (未配置)
-    """
-    errors: list[str] = []
-    project_exists = bool(project_dir and project_dir.is_dir())
-    converter_exists = bool(project_dir and (project_dir / "scripts" / "xml_to_ecgfm_mat.py").is_file())
-    inference_exists = bool(project_dir and (project_dir / "scripts" / "infer_quickstart.py").is_file())
-    checkpoint_exists = bool(checkpoint and checkpoint.is_file())
-    python_exists = bool(python_executable and python_executable.is_file())
-    python_callable = False
-    python_version = None
-
-    if not project_dir:
-        errors.append("ECGFM_PROJECT_DIR is not configured")
-    elif not project_exists:
-        errors.append(f"ECGFM_PROJECT_DIR does not exist: {project_dir}")
-    if project_exists and not converter_exists:
-        errors.append("xml_to_ecgfm_mat.py is missing")
-    if project_exists and not inference_exists:
-        errors.append("infer_quickstart.py is missing")
-    if not checkpoint:
-        errors.append("ECGFM_CHECKPOINT is not configured")
-    elif not checkpoint_exists:
-        errors.append(f"ECGFM_CHECKPOINT does not exist: {checkpoint}")
-    if not python_executable:
-        errors.append("ECGFM_PYTHON is not configured")
-    elif not python_exists:
-        errors.append(f"ECGFM_PYTHON does not exist: {python_executable}")
-    else:
-        try:
-            process = subprocess.run(
-                [str(python_executable), "--version"],
-                capture_output=True, text=True, timeout=5, check=True,
-            )
-            python_callable = True
-            python_version = (process.stdout or process.stderr).strip() or None
-        except (OSError, subprocess.SubprocessError) as error:
-            errors.append(f"ECGFM_PYTHON is not callable: {error}")
-
-    return {
-        "status": "healthy" if not errors else "unhealthy",
-        "projectDirExists": project_exists,
-        "converterScriptExists": converter_exists,
-        "inferenceScriptExists": inference_exists,
-        "checkpointExists": checkpoint_exists,
-        "checkpointSizeBytes": checkpoint.stat().st_size if checkpoint_exists else None,
-        "pythonExists": python_exists,
-        "pythonCallable": python_callable,
-        "pythonVersion": python_version,
-        "errors": errors,
-    }

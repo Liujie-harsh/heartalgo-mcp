@@ -1,4 +1,4 @@
-"""
+﻿"""
 心衰诊断 API (异步任务模式, 支持心超 + ECG 混合任务)。
 
 遵循《图像算法分析接口协议 v3》:
@@ -19,10 +19,11 @@ from __future__ import annotations
 import json
 from typing import Callable, Literal, Optional, Protocol
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from rules import analyze
+from combined_runner import InProcessTaskQueue
 
 
 # ────────────────── 指标元数据 (中文名/单位/参考范围) ──────────────────
@@ -117,11 +118,15 @@ class ImgItem(BaseModel):
 
     dcmType 仅心超图有值 (从 CardiacUltrasoundGroup.dcmType 带下), ECG 为 None。
     runner 按 dcmType 查 DCM_TYPE_TASKS 表做切面分流。
+
+    imgType 取值 (与 DB algorithm_input.input_type 枚举一致):
+      CARDIAC_ULTRASOUND - 心超
+      ECG                - 心电
     """
 
     imgId: str
     imgPath: str
-    imgType: str  # "Cardiac Ultrasound" | "ECG"
+    imgType: str  # "CARDIAC_ULTRASOUND" | "ECG"
     dcmType: Optional[str] = None
 
 
@@ -150,10 +155,16 @@ class Roi(BaseModel):
 
 
 class Report(BaseModel):
-    """单个模型分析报告, reportResult 为 JSON 字符串。"""
+    """单个模型分析报告, reportResult 为 JSON 字符串。
+
+    reportType 遵循 v3 协议:
+      CU-SUB     - 心超影像图对应的分析报告 (per-img)
+      CU-SUMMARY - 心超综合分析报告 (顶层汇总, 不关联单图)
+      ECG        - 心电图分析报告
+    """
 
     reportId: str
-    reportType: Literal["ECGFM", "MEASUREMENT"]
+    reportType: Literal["CU-SUB", "CU-SUMMARY", "ECG"]
     reportResult: str
 
 
@@ -222,7 +233,7 @@ class TaskStore:
         if old and old.get("requestId"):
             self._request_index.pop(old["requestId"], None)
         self._tasks[task_id] = {
-            "taskState": 1,
+            "taskState": 0,
             "result": None,
             "failedReason": None,
             "imgs": imgs,
@@ -241,6 +252,11 @@ class TaskStore:
             return None
         return task_id, self._tasks.get(task_id)
 
+    def mark_running(self, task_id: str) -> None:
+        """Worker 实际取得任务时：排队中(0) → 分析中(1)。"""
+        if self._tasks[task_id]["taskState"] == 0:
+            self._tasks[task_id]["taskState"] = 1
+
     def complete(self, task_id: str, result: dict) -> None:
         self._tasks[task_id]["taskState"] = 2
         self._tasks[task_id]["result"] = result
@@ -255,15 +271,16 @@ class TaskStore:
 def _flatten_request(req: StartRequest) -> list[ImgItem]:
     """将 v3 分组请求展平为 list[ImgItem], 供 runner 使用。
 
-    心超: dcmId→imgId, dcmPath→imgPath, imgType="Cardiac Ultrasound", dcmType 从 group 带下
-    ECG:  ecgId→imgId, ecgPath→imgPath, imgType="ECG", dcmType=None
+    imgType 用大写下划线常量 (与 DB input_type 枚举一致):
+      心超: CARDIAC_ULTRASOUND
+      ECG : ECG
     """
     imgs: list[ImgItem] = []
     for group in req.cardiacUltrasound:
         for dcm in group.dcms:
             imgs.append(ImgItem(
                 imgId=dcm.dcmId, imgPath=dcm.dcmPath,
-                imgType="Cardiac Ultrasound", dcmType=group.dcmType,
+                imgType="CARDIAC_ULTRASOUND", dcmType=group.dcmType,
             ))
     for ecg in req.ecg:
         imgs.append(ImgItem(
@@ -279,7 +296,8 @@ def create_app(
     sync: bool = False,
     work_root: str | None = None,
     store: TaskStore | None = None,
-    ecgfm_health_check: Callable[[], dict] | None = None,
+    task_queue: InProcessTaskQueue | None = None,
+    queue_worker_count: int = 1,
 ) -> FastAPI:
     """创建 FastAPI app。
 
@@ -295,19 +313,16 @@ def create_app(
     app.state.store = store or TaskStore()
     app.state.sync = sync
     app.state.work_root = work_root
-    app.state.ecgfm_health_check = ecgfm_health_check
+    app.state.owns_task_queue = task_queue is None
+    app.state.task_queue = task_queue or InProcessTaskQueue(worker_count=queue_worker_count)
 
-    @app.get("/health")
-    def health():
-        """健康检查端点。"""
-        if app.state.ecgfm_health_check is None:
-            ecgfm = {"status": "unconfigured", "errors": ["ECG-FM health check is not configured"]}
-        else:
-            ecgfm = app.state.ecgfm_health_check()
-        return {"status": "ok" if ecgfm.get("status") == "healthy" else "degraded", "ecgfm": ecgfm}
+    if app.state.owns_task_queue:
+        @app.on_event("shutdown")
+        def _close_task_queue() -> None:
+            app.state.task_queue.close(wait=True)
 
     @app.post("/heart-algo/task/start", response_model=StartResponse, response_model_exclude_none=True)
-    def start(req: StartRequest, background_tasks: BackgroundTasks):
+    def start(req: StartRequest):
         store: TaskStore = app.state.store
         # 幂等性检查 1: 同 requestId 重发 → 直接返回已有任务
         if req.requestId:
@@ -323,7 +338,7 @@ def create_app(
                 )
         # 幂等性检查 2: 同 taskId 已存在 → 返回已有状态
         existing = store.get(req.taskId)
-        if existing is not None and existing["taskState"] in (1, 2, 3):
+        if existing is not None and existing["taskState"] in (0, 1, 2, 3):
             return StartResponse(
                 responseId=req.requestId,
                 resultCode=0,
@@ -337,7 +352,7 @@ def create_app(
         if app.state.sync:
             _execute(app, req.taskId, imgs)
         else:
-            background_tasks.add_task(_execute, app, req.taskId, imgs)
+            app.state.task_queue.enqueue(_execute, app, req.taskId, imgs)
 
         task = store.get(req.taskId)
         is_failed = task["taskState"] == 3
@@ -401,7 +416,15 @@ def _echo_rois(result: dict, img_id: str) -> list[Roi]:
 
 
 def _fill_result_payload(response: ResultResponse, task_id: str, images: list[ImgItem], result: dict) -> None:
-    """按 ECG 与心超两类文件组装完成任务的响应。"""
+    """按 ECG 与心超两类文件组装完成任务的响应。
+
+    reportType 遵循 v3 协议:
+      - 心超 per-img 报告: CU-SUB
+      - ECG 报告: ECG
+      - 心超综合汇总报告: CU-SUMMARY (顶层追加, 不关联 cardiacUltrasound[])
+    """
+    echo_summary_keys = ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "gls", "hf_type")
+    has_echo_summary = any(key in result for key in ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "hf_type"))
     for image in images:
         if image.imgType == "ECG":
             report_id = f"{task_id}:{image.imgId}:ecg"
@@ -411,21 +434,24 @@ def _fill_result_payload(response: ResultResponse, task_id: str, images: list[Im
                 "measurements": result.get("ecg_measurements", {}).get(image.imgId, {}),
                 "predictions": result.get("ecg_predictions", {}).get(image.imgId, []),
             }
-            response.reports.append(Report(reportId=report_id, reportType="ECGFM", reportResult=_json_report(payload)))
+            response.reports.append(Report(reportId=report_id, reportType="ECG", reportResult=_json_report(payload)))
             response.ecg.append(ECGResult(ecgId=image.imgId, ecgPath=image.imgPath, reportId=report_id))
-        elif image.imgType == "Cardiac Ultrasound":
+        elif image.imgType == "CARDIAC_ULTRASOUND":
             report_id = f"{task_id}:{image.imgId}:measurement"
             per_image = result.get("echo_per_image", {}).get(image.imgId, {})
             if not per_image:
                 per_image = {
                     key: result[key]
-                    for key in ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "hf_type")
+                    for key in echo_summary_keys
                     if key in result
                 }
             # measurements 带中文名/单位/参考范围
             measurements: dict = {}
             for key, value in per_image.items():
                 if key in {"rois", "error", "skipReason"}:
+                    continue
+                if key == "hf_type":
+                    measurements[key] = value
                     continue
                 meta = METRIC_META.get(key)
                 if meta:
@@ -440,13 +466,35 @@ def _fill_result_payload(response: ResultResponse, task_id: str, images: list[Im
                 payload["skipReason"] = per_image["skipReason"]
             if per_image.get("error"):
                 payload["error"] = per_image["error"]
-            response.reports.append(Report(reportId=report_id, reportType="MEASUREMENT", reportResult=_json_report(payload)))
+            response.reports.append(Report(reportId=report_id, reportType="CU-SUB", reportResult=_json_report(payload)))
             response.cardiacUltrasound.append(CardiacUltrasoundResult(
                 dcmId=image.imgId,
                 dcmPath=image.imgPath,
                 reportId=report_id,
                 rois=_echo_rois(result, image.imgId),
             ))
+
+    # 心超综合汇总报告 (CU-SUMMARY): 顶层追加, 汇总 HF 分型 + 核心指标, 不关联 cardiacUltrasound[]
+    if has_echo_summary:
+        summary_measurements: dict = {}
+        for key in echo_summary_keys:
+            if key not in result:
+                continue
+            value = result[key]
+            if key == "hf_type":
+                summary_measurements[key] = value
+                continue
+            meta = METRIC_META.get(key)
+            if meta:
+                summary_measurements[key] = {"value": value, **meta}
+            else:
+                summary_measurements[key] = {"value": value}
+        summary_payload = {"taskId": task_id, "measurements": summary_measurements}
+        response.reports.append(Report(
+            reportId=f"{task_id}:cu-summary",
+            reportType="CU-SUMMARY",
+            reportResult=_json_report(summary_payload),
+        ))
 
 
 def _fill_failure_payload(response: ResultResponse, task_id: str, images: list[ImgItem], reason: str | None) -> None:
@@ -457,15 +505,15 @@ def _fill_failure_payload(response: ResultResponse, task_id: str, images: list[I
             report_id = f"{task_id}:{image.imgId}:ecg"
             response.reports.append(Report(
                 reportId=report_id,
-                reportType="ECGFM",
+                reportType="ECG",
                 reportResult=_json_report({"ecgId": image.imgId, "error": failure_reason}),
             ))
             response.ecg.append(ECGResult(ecgId=image.imgId, ecgPath=image.imgPath, reportId=report_id))
-        elif image.imgType == "Cardiac Ultrasound":
+        elif image.imgType == "CARDIAC_ULTRASOUND":
             report_id = f"{task_id}:{image.imgId}:measurement"
             response.reports.append(Report(
                 reportId=report_id,
-                reportType="MEASUREMENT",
+                reportType="CU-SUB",
                 reportResult=_json_report({"dcmId": image.imgId, "error": failure_reason}),
             ))
             response.cardiacUltrasound.append(CardiacUltrasoundResult(
@@ -483,7 +531,10 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
     runner: InferenceRunner = app.state.runner
     work_root: str | None = getattr(app.state, "work_root", None)
     try:
+        store.mark_running(task_id)
         raw_result = runner.run(imgs, task_id=task_id, work_root=work_root)
+        if "mv_ea" not in raw_result and "ea" in raw_result:
+            raw_result["mv_ea"] = raw_result["ea"]
         echo_keys = ("lvef", "lvedd", "lvesd", "lad", "mv_ea")
         has_echo = any(key in raw_result for key in echo_keys)
         result: dict = {
@@ -497,7 +548,7 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
             missing = [key for key in echo_keys if key not in raw_result]
             if missing:
                 raise ValueError(f"Echo runner result is missing: {', '.join(missing)}")
-            result.update(analyze(**{key: raw_result[key] for key in echo_keys}))
+            result.update(analyze(**{key: raw_result[key] for key in echo_keys}, gls=raw_result.get("gls")))
         store.complete(task_id, result)
     except Exception as exc:
         store.fail(task_id, str(exc))
