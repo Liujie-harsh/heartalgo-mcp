@@ -31,6 +31,8 @@ def build_app(
     ecg_top_k: int | None = None,
     ecg_timeout_seconds: int | None = None,
     task_work_root: str | None = None,
+    task_store_backend: str | None = None,
+    database_url: str | None = None,
 ):
     """构建 app，注入实际 runner、任务目录与两个模型的健康检查回调。"""
     work_root = task_work_root or os.environ.get("TASK_WORK_ROOT")
@@ -44,7 +46,7 @@ def build_app(
     if use_fake:
         runner = FakeRunner(metrics={
             "lvef": 35.48, "lvedd": 55.0, "lvesd": 40.0,
-            "lad": 35.0, "ea": 2.02, "gls": None,
+            "lad": 35.0, "mv_ea": 2.02,
         })
     else:
         from combined_runner import CombinedRunner
@@ -67,13 +69,27 @@ def build_app(
         gpu_ids = [item.strip() for item in os.environ.get("PYTHON_GPU_IDS", "0").split(",") if item.strip()]
         runner = CombinedRunner(echo_runner=echo_runner, ecg_runner=ecg_runner, gpu_pool=GPUResourcePool(gpu_ids))
 
+    backend = (task_store_backend or os.environ.get("TASK_STORE_BACKEND", "memory")).lower()
+    if backend not in {"memory", "mysql"}:
+        raise ValueError("TASK_STORE_BACKEND must be 'memory' or 'mysql'")
+    task_store = None
+    if backend == "mysql":
+        resolved_database_url = database_url or os.environ.get("DATABASE_URL")
+        if not resolved_database_url:
+            raise ValueError("DATABASE_URL is required when TASK_STORE_BACKEND=mysql")
+        from database.mysql_task_store import MySQLTaskStore
+
+        task_store = MySQLTaskStore(resolved_database_url)
+
     queue_workers = int(os.environ.get("PYTHON_QUEUE_WORKERS", "1"))
     app = create_app(
         runner=runner,
         sync=False,
         work_root=work_root,
+        store=task_store,
         queue_worker_count=queue_workers,
     )
+    app.state.task_store_backend = backend
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -104,6 +120,10 @@ if __name__ == "__main__":
                         help="ECG 单阶段超时秒数（支持 ECGFM_TIMEOUT_SECONDS）")
     parser.add_argument("--task-work-root", type=str, default="G:\\heart-algo\\runtime",
                         help="任务产物根目录")
+    parser.add_argument("--task-store", choices=("memory", "mysql"), default=None,
+                        help="任务存储后端（默认读取 TASK_STORE_BACKEND，未配置时为 memory）")
+    parser.add_argument("--database-url", type=str, default=None,
+                        help="MySQL SQLAlchemy URL；建议通过 DATABASE_URL 环境变量传入")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -119,6 +139,8 @@ if __name__ == "__main__":
         ecg_top_k=args.ecg_top_k,
         ecg_timeout_seconds=args.ecg_timeout_seconds,
         task_work_root=args.task_work_root,
+        task_store_backend=args.task_store,
+        database_url=args.database_url,
     )
     measurement_dir = (
         args.measurement_script_dir or args.script_dir
@@ -130,6 +152,7 @@ if __name__ == "__main__":
         or MeasurementConfig.DEFAULT_PYTHON_EXECUTABLE
     )
     print(f"[启动] fake={args.fake} | measurement_script_dir={measurement_dir}")
+    print(f"  task_store         : {app.state.task_store_backend}")
     print(f"  work_root          : {args.task_work_root or os.environ.get('TASK_WORK_ROOT')}")
     if not args.fake:
         print(f"  Measurement python : {measurement_python}")

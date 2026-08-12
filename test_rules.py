@@ -3,21 +3,18 @@
 
 测试行为 (非实现):
   1. HF 分型: 由 LVEF 阈值决定 (HFrEF <40 / HFmrEF 40-49 / HFpEF ≥50)
-  2. 6 项指标异常标红: 按 handoff 参考范围判定
-  3. GLS=null: 不标红, 标注"未测量"
-  4. 接口契约: analyze() 返回 {lvef, lvedd, lvesd, lad, ea, mv_ea, gls, hf_type}
-  5. v3 兼容: ea → mv_ea 字段名统一, 两者同时返回 (向后兼容)
-  6. 阶段 2 容错: lvef=None → hf_type="未知" (所有 2D 图失败时不抛异常)
+  2. 核心指标异常标红: 按参考范围判定
+  3. 接口契约: analyze() 返回 {lvef, lvedd, lvesd, lad, ea, mv_ea, hf_type}
+  4. v3 兼容: ea → mv_ea 字段名统一, 两者同时返回 (向后兼容)
+  5. 阶段 2 容错: lvef=None → hf_type="未知" (所有 2D 图失败时不抛异常)
 
 参考范围 (handoff.md L25-L32):
   LVEF  ≥50%        <50 标红
   LVEDD 42-58 mm    超范围标红
   LVESD 25-37 mm    超范围标红
   LAD   27-38 mm    超范围标红
-  E/A   0.8-1.5     超范围标红
-  GLS   ≤-16%       >-16 标红
+  E/A   0.8-2.0     超范围标红
 """
-import pytest
 from rules import classify_hf, flag_abnormal, analyze
 
 
@@ -53,7 +50,7 @@ class TestClassifyHF:
 # ────────────────── 指标异常标红 ──────────────────
 
 class TestFlagAbnormal:
-    """6 项指标按参考范围判定是否异常 (标红)。"""
+    """核心指标按参考范围判定是否异常 (标红)。"""
 
     def test_lvef_below_50_is_abnormal(self):
         assert flag_abnormal("LVEF", 35) is True
@@ -79,51 +76,34 @@ class TestFlagAbnormal:
     def test_lad_above_38_is_abnormal(self):
         assert flag_abnormal("LAD", 42) is True
 
-    def test_ea_within_08_15_is_normal(self):
-        # 高汉平 00020 PW 实测 E/A=2.02, 超出 1.5 上界 → 异常
-        assert flag_abnormal("E/A", 1.2) is False
+    def test_ea_within_08_20_is_normal(self):
+        assert flag_abnormal("E/A", 1.8) is False
 
-    def test_ea_above_15_is_abnormal(self):
+    def test_ea_above_20_is_abnormal(self):
         assert flag_abnormal("E/A", 2.02) is True
 
-    def test_mv_ea_within_08_15_is_normal(self):
+    def test_mv_ea_within_08_20_is_normal(self):
         # v3: MV_EA 与 E/A 共用参考范围
-        assert flag_abnormal("MV_EA", 1.2) is False
+        assert flag_abnormal("MV_EA", 1.8) is False
 
-    def test_mv_ea_above_15_is_abnormal(self):
+    def test_mv_ea_above_20_is_abnormal(self):
         assert flag_abnormal("MV_EA", 2.02) is True
-
-    def test_gls_above_minus16_is_abnormal(self):
-        # GLS > -16 标红 (如 -12 大于 -16)
-        assert flag_abnormal("GLS", -12) is True
-
-    def test_gls_equal_minus16_is_normal(self):
-        assert flag_abnormal("GLS", -16) is False
-
-    def test_gls_null_is_not_abnormal(self):
-        # GLS 砍掉返回 null, 不标红 (架构决策)
-        assert flag_abnormal("GLS", None) is False
 
 
 # ────────────────── 接口契约 (端到端) ──────────────────
 
 class TestAnalyzeContract:
-    """analyze() 返回结构必须包含 6 项指标, 契约稳定。"""
+    """analyze() 返回结构必须包含核心指标, 契约稳定。"""
 
     def test_returns_six_metrics_keys(self):
-        # handoff L34 契约: 6 项指标必须存在; hf_type 为报告附加字段
-        result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02, gls=None)
-        required = {"lvef", "lvedd", "lvesd", "lad", "ea", "gls"}
+        result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02)
+        required = {"lvef", "lvedd", "lvesd", "lad", "ea", "mv_ea"}
         assert required.issubset(result.keys())
-
-    def test_gls_null_preserved(self):
-        # GLS 砍掉, null 必须原样保留在输出里
-        result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02, gls=None)
-        assert result["gls"] is None
+        assert "gls" not in result
 
     def test_includes_hf_classification(self):
         # 报告需输出心衰分型诊断
-        result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02, gls=None)
+        result = analyze(lvef=35.48, lvedd=55.0, lvesd=40.0, lad=35.0, ea=2.02)
         assert result["hf_type"] == "HFrEF"
 
 

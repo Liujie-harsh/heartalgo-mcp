@@ -1,0 +1,25 @@
+"""心超指标展示元数据的唯一数据源。"""
+
+METRIC_META: dict[str, dict[str, str]] = {
+    "aorticroot": {"name_cn": "主动脉根部内径", "unit": "mm", "reference": "20–37"},
+    "aorta": {"name_cn": "升主动脉内径", "unit": "mm", "reference": "20–37"},
+    "lad": {"name_cn": "左房内径", "unit": "mm", "reference": "19–40"},
+    "lvedd": {"name_cn": "左室舒末径", "unit": "mm", "reference": "35–55"},
+    "lvesd": {"name_cn": "左室缩末径", "unit": "mm", "reference": "25–35"},
+    "ivs": {"name_cn": "室间隔厚", "unit": "mm", "reference": "6–11"},
+    "lvpw": {"name_cn": "左室后壁厚", "unit": "mm", "reference": "6–11"},
+    "rvbase": {"name_cn": "右室内径", "unit": "mm", "reference": "0–20"},
+    "ivc": {"name_cn": "下腔静脉内径", "unit": "mm", "reference": "10–25"},
+    "pa": {"name_cn": "主肺动脉", "unit": "mm", "reference": "0–26"},
+    "lvef": {"name_cn": "左室射血分数(EF)", "unit": "%", "reference": "55–70"},
+    "mv_e": {"name_cn": "二尖瓣E峰流速", "unit": "cm/s", "reference": "60–130"},
+    "mv_a": {"name_cn": "二尖瓣A峰流速", "unit": "cm/s", "reference": "40–100"},
+    "mv_ea": {"name_cn": "E/A", "unit": "-", "reference": "0.8–2.0"},
+    "av_vmax": {"name_cn": "主动脉瓣峰值流速", "unit": "cm/s", "reference": "70–220"},
+    "tr_vmax": {"name_cn": "三尖瓣反流峰值流速", "unit": "cm/s", "reference": "≤280"},
+    "mr_vmax": {"name_cn": "二尖瓣反流峰值流速", "unit": "cm/s", "reference": "—"},
+    "lvot_vmax": {"name_cn": "左室流出道峰值流速", "unit": "cm/s", "reference": "70–120"},
+    "tdi_lateral": {"name_cn": "二尖瓣环侧壁 e'", "unit": "cm/s", "reference": "≥10"},
+    "tdi_medial": {"name_cn": "二尖瓣环间隔侧 e'", "unit": "cm/s", "reference": "≥7"},
+    "tapse": {"name_cn": "TAPSE", "unit": "mm", "reference": "≥17"},
+}

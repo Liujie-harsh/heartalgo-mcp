@@ -204,18 +204,16 @@ def test_l4(dcm_2d: str, dcm_pw: str):
     try:
         result = runner.run(imgs)
         print(f"  [INFO] 完整结果: {result}")
-        required = {"lvef", "lvedd", "lvesd", "lad", "ea", "gls"}
+        required = {"lvef", "lvedd", "lvesd", "lad", "mv_ea"}
         if not required.issubset(result.keys()):
             fail(f"结果缺字段: {required - set(result.keys())}")
-        if result["gls"] is not None:
-            fail(f"GLS 应为 None, 实际 {result['gls']}")
-        if result["lvef"] is None or result["ea"] is None:
-            fail(f"LVEF/EA 不应为 None: lvef={result['lvef']}, ea={result['ea']}")
+        if result["lvef"] is None or result["mv_ea"] is None:
+            fail(f"LVEF/MV_EA 不应为 None: lvef={result['lvef']}, mv_ea={result['mv_ea']}")
 
         # 规则引擎汇总
         from rules import classify_hf
         hf = classify_hf(result["lvef"])
-        ok(f"6 项指标齐全: LVEF={result['lvef']}%, E/A={result['ea']}, GLS=null")
+        ok(f"核心指标齐全: LVEF={result['lvef']}%, E/A={result['mv_ea']}")
         ok(f"HF 分型: {hf} (LVEF={result['lvef']}%)")
     except Exception as e:
         fail("Runner.run 异常", e)

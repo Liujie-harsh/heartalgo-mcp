@@ -65,11 +65,16 @@ def mixed_client(fake_mixed_runner):
     return TestClient(app)
 
 
-def _v3_start_body(task_id="task-1", dcm_type="PLAX", request_id="req-1"):
+def _v3_start_body(
+    task_id="task-1",
+    dcm_type="PLAX",
+    request_id="req-1",
+    user_id="user-1",
+):
     """构造 v3 start 请求体 (仅心超)。"""
     return {
         "requestId": request_id,
-        "sysUserId": "user-1",
+        "sysUserId": user_id,
         "taskId": task_id,
         "cardiacUltrasound": [
             {
@@ -135,6 +140,52 @@ class TestStartTask:
         # 返回首个任务的 taskId, 不创建 t-b
         assert body["taskId"] == "t-a"
 
+    def test_request_id_is_unique_per_user(self, client):
+        # 同 requestId、不同 sysUserId → 分别创建任务
+        first = client.post(
+            "/heart-algo/task/start",
+            json=_v3_start_body(
+                task_id="t-user-a",
+                request_id="req-shared",
+                user_id="user-a",
+            ),
+        )
+        second = client.post(
+            "/heart-algo/task/start",
+            json=_v3_start_body(
+                task_id="t-user-b",
+                request_id="req-shared",
+                user_id="user-b",
+            ),
+        )
+
+        assert first.json()["taskId"] == "t-user-a"
+        assert second.json()["taskId"] == "t-user-b"
+
+    def test_other_user_cannot_reuse_existing_task_id(self, client):
+        client.post(
+            "/heart-algo/task/start",
+            json=_v3_start_body(
+                task_id="task-shared",
+                request_id="request-a",
+                user_id="user-a",
+            ),
+        )
+
+        resp = client.post(
+            "/heart-algo/task/start",
+            json=_v3_start_body(
+                task_id="task-shared",
+                request_id="request-b",
+                user_id="user-b",
+            ),
+        )
+
+        body = resp.json()
+        assert body["resultCode"] == 1
+        assert body["taskState"] == 3
+        assert "task id conflict" in body["resultMsg"]
+
     def test_failed_reason_excluded_when_success(self, client):
         # response_model_exclude_none: 成功时 failedReason 字段不出现
         resp = client.post("/heart-algo/task/start", json=_v3_start_body())
@@ -189,6 +240,7 @@ class TestResultTask:
         summary_payload = json.loads(summary_report["reportResult"])
         assert "measurements" in summary_payload
         assert summary_payload["measurements"]["hf_type"] == "HFrEF"
+        assert "gls" not in summary_payload["measurements"]
 
     def test_measurements_include_metadata(self, client):
         # measurements 含中文名/单位/参考范围 (METRIC_META)
@@ -213,6 +265,21 @@ class TestResultTask:
         body = resp.json()
         assert body["taskState"] == 3
         assert body["failedReason"] is not None
+
+    def test_other_user_cannot_read_task_result(self, client):
+        self._start_task(client)
+
+        resp = client.post("/heart-algo/task/result", json={
+            "requestId": "req-other",
+            "sysUserId": "other-user",
+            "taskId": "task-1",
+        })
+
+        body = resp.json()
+        assert body["resultCode"] == 1
+        assert body["taskState"] == 3
+        assert body["reports"] == []
+        assert "task not found" in body["failedReason"]
 
     def test_failed_reason_excluded_when_success(self, client):
         # response_model_exclude_none: 成功时 failedReason 字段不出现
@@ -292,7 +359,7 @@ class TestRois:
         c = TestClient(app)
         c.post("/heart-algo/task/start", json=_v3_start_body())
         resp = c.post("/heart-algo/task/result", json={
-            "requestId": "req-2", "sysUserId": "u1", "taskId": "task-1",
+            "requestId": "req-2", "sysUserId": "user-1", "taskId": "task-1",
         })
         body = resp.json()
         rois = body["cardiacUltrasound"][0]["rois"]
@@ -311,7 +378,7 @@ class TestRois:
         c = TestClient(app)
         c.post("/heart-algo/task/start", json=_v3_start_body(dcm_type="MV_EA"))
         resp = c.post("/heart-algo/task/result", json={
-            "requestId": "req-2", "sysUserId": "u1", "taskId": "task-1",
+            "requestId": "req-2", "sysUserId": "user-1", "taskId": "task-1",
         })
         body = resp.json()
         assert body["cardiacUltrasound"][0]["rois"] == []
@@ -331,7 +398,7 @@ class TestInferenceFailure:
 
         c.post("/heart-algo/task/start", json=_v3_start_body(task_id="t1"))
         resp = c.post("/heart-algo/task/result", json={
-            "requestId": "req-2", "sysUserId": "u1", "taskId": "t1",
+            "requestId": "req-2", "sysUserId": "user-1", "taskId": "t1",
         })
         body = resp.json()
         assert body["taskState"] == 3
@@ -345,7 +412,7 @@ class TestInferenceFailure:
         c = TestClient(app)
         c.post("/heart-algo/task/start", json=_v3_start_body(task_id="t1"))
         resp = c.post("/heart-algo/task/result", json={
-            "requestId": "req-2", "sysUserId": "u1", "taskId": "t1",
+            "requestId": "req-2", "sysUserId": "user-1", "taskId": "t1",
         })
         body = resp.json()
         assert body["taskState"] == 3

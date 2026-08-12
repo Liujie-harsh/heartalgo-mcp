@@ -17,44 +17,16 @@ v3 响应体心超与 ECG 分离:
 from __future__ import annotations
 
 import json
-from typing import Callable, Literal, Optional, Protocol
+from typing import Literal, Optional, Protocol
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from rules import analyze
 from combined_runner import InProcessTaskQueue
-
-
-# ────────────────── 指标元数据 (中文名/单位/参考范围) ──────────────────
-
-METRIC_META: dict[str, dict[str, str]] = {
-    # B-Mode 距离/厚度 (mm)
-    "aorticroot":  {"name_cn": "主动脉根部内径",     "unit": "mm",   "reference": "20–37"},
-    "aorta":       {"name_cn": "升主动脉内径",       "unit": "mm",   "reference": "20–37"},
-    "lad":         {"name_cn": "左房内径",          "unit": "mm",   "reference": "19–40"},
-    "lvedd":       {"name_cn": "左室舒末径",        "unit": "mm",   "reference": "35–55"},
-    "lvesd":       {"name_cn": "左室缩末径",        "unit": "mm",   "reference": "25–35"},
-    "ivs":         {"name_cn": "室间隔厚",          "unit": "mm",   "reference": "6–11"},
-    "lvpw":        {"name_cn": "左室后壁厚",        "unit": "mm",   "reference": "6–11"},
-    "rvbase":      {"name_cn": "右室内径",          "unit": "mm",   "reference": "0–20"},
-    "ivc":         {"name_cn": "下腔静脉内径",      "unit": "mm",   "reference": "10–25"},
-    "pa":          {"name_cn": "主肺动脉",          "unit": "mm",   "reference": "0–26"},
-    "lvef":        {"name_cn": "左室射血分数(EF)",   "unit": "%",    "reference": "55–70"},
-    # Doppler 流速 (cm/s)
-    "mv_e":        {"name_cn": "二尖瓣E峰流速",     "unit": "cm/s", "reference": "60–130"},
-    "mv_a":        {"name_cn": "二尖瓣A峰流速",     "unit": "cm/s", "reference": "40–100"},
-    "mv_ea":       {"name_cn": "E/A",              "unit": "-",    "reference": "0.8–2.0"},
-    "av_vmax":     {"name_cn": "主动脉瓣峰值流速",   "unit": "cm/s", "reference": "70–220"},
-    "tr_vmax":     {"name_cn": "三尖瓣反流峰值流速", "unit": "cm/s", "reference": "≤280"},
-    "mr_vmax":     {"name_cn": "二尖瓣反流峰值流速", "unit": "cm/s", "reference": "—"},
-    "lvot_vmax":   {"name_cn": "左室流出道峰值流速", "unit": "cm/s", "reference": "70–120"},
-    # TDI (cm/s)
-    "tdi_lateral": {"name_cn": "二尖瓣环侧壁 e'",   "unit": "cm/s", "reference": "≥10"},
-    "tdi_medial":  {"name_cn": "二尖瓣环间隔侧 e'", "unit": "cm/s", "reference": "≥7"},
-    # M-Mode (mm)
-    "tapse":       {"name_cn": "TAPSE",            "unit": "mm",   "reference": "≥17"},
-}
+from task_models import ImgItem
+from task_outcome import build_success_outcome
+from task_store import InMemoryTaskStore, TaskOwnershipError, TaskStore
 
 
 # ────────────────── v3 请求体模型 ──────────────────
@@ -109,25 +81,6 @@ class ResultRequest(BaseModel):
     requestId: str
     sysUserId: str
     taskId: str
-
-
-# ────────────────── 内部展平模型 (runner 接口) ──────────────────
-
-class ImgItem(BaseModel):
-    """内部展平后的图像项, 由 start 请求体转换而来。
-
-    dcmType 仅心超图有值 (从 CardiacUltrasoundGroup.dcmType 带下), ECG 为 None。
-    runner 按 dcmType 查 DCM_TYPE_TASKS 表做切面分流。
-
-    imgType 取值 (与 DB algorithm_input.input_type 枚举一致):
-      CARDIAC_ULTRASOUND - 心超
-      ECG                - 心电
-    """
-
-    imgId: str
-    imgPath: str
-    imgType: str  # "CARDIAC_ULTRASOUND" | "ECG"
-    dcmType: Optional[str] = None
 
 
 # ────────────────── v3 响应体模型 ──────────────────
@@ -213,59 +166,6 @@ class FakeRunner:
         return dict(self._metrics)
 
 
-# ────────────────── 任务存储 ──────────────────
-
-class TaskStore:
-    """内存任务存储。生产部署换 Redis/DB 支持多进程。
-
-    幂等规则:
-      - 同 taskId 已存在: 返回已有状态, 不重复启动 (taskId 幂等)
-      - 同 requestId 重发: 视为重复请求, 返回已有结果 (requestId 幂等)
-    """
-
-    def __init__(self):
-        self._tasks: dict[str, dict] = {}
-        self._request_index: dict[str, str] = {}  # requestId → taskId
-
-    def create(self, task_id: str, imgs: list[ImgItem], request_id: str = "") -> None:
-        # 清理旧 requestId 映射 (taskId 被覆盖时)
-        old = self._tasks.get(task_id)
-        if old and old.get("requestId"):
-            self._request_index.pop(old["requestId"], None)
-        self._tasks[task_id] = {
-            "taskState": 0,
-            "result": None,
-            "failedReason": None,
-            "imgs": imgs,
-            "requestId": request_id,
-        }
-        if request_id:
-            self._request_index[request_id] = task_id
-
-    def get(self, task_id: str) -> Optional[dict]:
-        return self._tasks.get(task_id)
-
-    def get_by_request_id(self, request_id: str) -> Optional[tuple[str, dict]]:
-        """同 requestId 重发 → 返回 (taskId, task), 不重复创建。"""
-        task_id = self._request_index.get(request_id)
-        if task_id is None:
-            return None
-        return task_id, self._tasks.get(task_id)
-
-    def mark_running(self, task_id: str) -> None:
-        """Worker 实际取得任务时：排队中(0) → 分析中(1)。"""
-        if self._tasks[task_id]["taskState"] == 0:
-            self._tasks[task_id]["taskState"] = 1
-
-    def complete(self, task_id: str, result: dict) -> None:
-        self._tasks[task_id]["taskState"] = 2
-        self._tasks[task_id]["result"] = result
-
-    def fail(self, task_id: str, reason: str) -> None:
-        self._tasks[task_id]["taskState"] = 3
-        self._tasks[task_id]["failedReason"] = reason
-
-
 # ────────────────── 请求展平 ──────────────────
 
 def _flatten_request(req: StartRequest) -> list[ImgItem]:
@@ -310,7 +210,7 @@ def create_app(
     """
     app = FastAPI(title="心衰诊断算法服务")
     app.state.runner = runner
-    app.state.store = store or TaskStore()
+    app.state.store = store or InMemoryTaskStore()
     app.state.sync = sync
     app.state.work_root = work_root
     app.state.owns_task_queue = task_queue is None
@@ -324,50 +224,50 @@ def create_app(
     @app.post("/heart-algo/task/start", response_model=StartResponse, response_model_exclude_none=True)
     def start(req: StartRequest):
         store: TaskStore = app.state.store
-        # 幂等性检查 1: 同 requestId 重发 → 直接返回已有任务
-        if req.requestId:
-            existing_by_req = store.get_by_request_id(req.requestId)
-            if existing_by_req is not None:
-                existing_task_id, existing_task = existing_by_req
-                return StartResponse(
-                    responseId=req.requestId,
-                    resultCode=0,
-                    resultMsg=f"duplicate request, task state={existing_task['taskState']}",
-                    taskId=existing_task_id,
-                    taskState=existing_task["taskState"],
-                )
-        # 幂等性检查 2: 同 taskId 已存在 → 返回已有状态
-        existing = store.get(req.taskId)
-        if existing is not None and existing["taskState"] in (0, 1, 2, 3):
+        imgs = _flatten_request(req)
+        try:
+            task_id, task, created = store.create_or_get(
+                req.taskId,
+                imgs,
+                request_id=req.requestId,
+                sys_user_id=req.sysUserId,
+            )
+        except TaskOwnershipError:
+            return StartResponse(
+                responseId=req.requestId,
+                resultCode=1,
+                resultMsg="task id conflict",
+                taskId=req.taskId,
+                taskState=3,
+            )
+        if not created:
             return StartResponse(
                 responseId=req.requestId,
                 resultCode=0,
-                resultMsg=f"task already exists, state={existing['taskState']}",
-                taskId=req.taskId,
-                taskState=existing["taskState"],
+                resultMsg=f"task already exists, state={task['taskState']}",
+                taskId=task_id,
+                taskState=task["taskState"],
             )
 
-        imgs = _flatten_request(req)
-        store.create(req.taskId, imgs, request_id=req.requestId)
         if app.state.sync:
-            _execute(app, req.taskId, imgs)
+            _execute(app, task_id, imgs)
         else:
-            app.state.task_queue.enqueue(_execute, app, req.taskId, imgs)
+            app.state.task_queue.enqueue(_execute, app, task_id, imgs)
 
-        task = store.get(req.taskId)
+        task = store.get(task_id)
         is_failed = task["taskState"] == 3
         return StartResponse(
             responseId=req.requestId,
             resultCode=1 if is_failed else 0,
             resultMsg=task.get("failedReason", "") if is_failed else "success",
-            taskId=req.taskId,
+            taskId=task_id,
             taskState=task["taskState"],
         )
 
     @app.post("/heart-algo/task/result", response_model=ResultResponse, response_model_exclude_none=True)
     def result(req: ResultRequest):
         store: TaskStore = app.state.store
-        task = store.get(req.taskId)
+        task = store.get_for_user(req.taskId, req.sysUserId)
         if task is None:
             return ResultResponse(
                 responseId=req.requestId,
@@ -388,7 +288,7 @@ def create_app(
             failedReason=task["failedReason"],
         )
         if task["taskState"] == 2 and task["result"] is not None:
-            _fill_result_payload(response, req.taskId, task["imgs"], task["result"])
+            _fill_result_payload(response, task["result"])
         elif task["taskState"] == 3:
             _fill_failure_payload(response, req.taskId, task["imgs"], task["failedReason"])
         return response
@@ -403,98 +303,19 @@ def _json_report(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _echo_rois(result: dict, img_id: str) -> list[Roi]:
-    """将推理器的心超 ROI 转换为对外协议字段。"""
-    segments = result.get("echo_per_image", {}).get(img_id, {}).get("rois", [])
-    return [
-        Roi(
-            roiType=segment["type"],
-            points=[RoiPoint(xPos=int(point[0]), yPos=int(point[1])) for point in segment["points"]],
-        )
-        for segment in segments
-    ]
-
-
-def _fill_result_payload(response: ResultResponse, task_id: str, images: list[ImgItem], result: dict) -> None:
-    """按 ECG 与心超两类文件组装完成任务的响应。
-
-    reportType 遵循 v3 协议:
-      - 心超 per-img 报告: CU-SUB
-      - ECG 报告: ECG
-      - 心超综合汇总报告: CU-SUMMARY (顶层追加, 不关联 cardiacUltrasound[])
-    """
-    echo_summary_keys = ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "gls", "hf_type")
-    has_echo_summary = any(key in result for key in ("lvef", "lvedd", "lvesd", "lad", "mv_ea", "hf_type"))
-    for image in images:
-        if image.imgType == "ECG":
-            report_id = f"{task_id}:{image.imgId}:ecg"
-            payload = {
-                "ecgId": image.imgId,
-                "patientInfo": result.get("ecg_patient_info", {}).get(image.imgId, {}),
-                "measurements": result.get("ecg_measurements", {}).get(image.imgId, {}),
-                "predictions": result.get("ecg_predictions", {}).get(image.imgId, []),
-            }
-            response.reports.append(Report(reportId=report_id, reportType="ECG", reportResult=_json_report(payload)))
-            response.ecg.append(ECGResult(ecgId=image.imgId, ecgPath=image.imgPath, reportId=report_id))
-        elif image.imgType == "CARDIAC_ULTRASOUND":
-            report_id = f"{task_id}:{image.imgId}:measurement"
-            per_image = result.get("echo_per_image", {}).get(image.imgId, {})
-            if not per_image:
-                per_image = {
-                    key: result[key]
-                    for key in echo_summary_keys
-                    if key in result
-                }
-            # measurements 带中文名/单位/参考范围
-            measurements: dict = {}
-            for key, value in per_image.items():
-                if key in {"rois", "error", "skipReason"}:
-                    continue
-                if key == "hf_type":
-                    measurements[key] = value
-                    continue
-                meta = METRIC_META.get(key)
-                if meta:
-                    measurements[key] = {"value": value, **meta}
-                else:
-                    measurements[key] = {"value": value}
-            payload = {
-                "dcmId": image.imgId,
-                "measurements": measurements,
-            }
-            if per_image.get("skipReason"):
-                payload["skipReason"] = per_image["skipReason"]
-            if per_image.get("error"):
-                payload["error"] = per_image["error"]
-            response.reports.append(Report(reportId=report_id, reportType="CU-SUB", reportResult=_json_report(payload)))
-            response.cardiacUltrasound.append(CardiacUltrasoundResult(
-                dcmId=image.imgId,
-                dcmPath=image.imgPath,
-                reportId=report_id,
-                rois=_echo_rois(result, image.imgId),
-            ))
-
-    # 心超综合汇总报告 (CU-SUMMARY): 顶层追加, 汇总 HF 分型 + 核心指标, 不关联 cardiacUltrasound[]
-    if has_echo_summary:
-        summary_measurements: dict = {}
-        for key in echo_summary_keys:
-            if key not in result:
-                continue
-            value = result[key]
-            if key == "hf_type":
-                summary_measurements[key] = value
-                continue
-            meta = METRIC_META.get(key)
-            if meta:
-                summary_measurements[key] = {"value": value, **meta}
-            else:
-                summary_measurements[key] = {"value": value}
-        summary_payload = {"taskId": task_id, "measurements": summary_measurements}
+def _fill_result_payload(response: ResultResponse, outcome: dict) -> None:
+    """将存储层的结构化任务输出转换为 v3 响应模型。"""
+    for report in outcome.get("reports", []):
         response.reports.append(Report(
-            reportId=f"{task_id}:cu-summary",
-            reportType="CU-SUMMARY",
-            reportResult=_json_report(summary_payload),
+            reportId=report["reportId"],
+            reportType=report["reportType"],
+            reportResult=_json_report(report["reportResult"]),
         ))
+    response.cardiacUltrasound.extend(
+        CardiacUltrasoundResult(**item)
+        for item in outcome.get("cardiacUltrasound", [])
+    )
+    response.ecg.extend(ECGResult(**item) for item in outcome.get("ecg", []))
 
 
 def _fill_failure_payload(response: ResultResponse, task_id: str, images: list[ImgItem], reason: str | None) -> None:
@@ -531,7 +352,8 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
     runner: InferenceRunner = app.state.runner
     work_root: str | None = getattr(app.state, "work_root", None)
     try:
-        store.mark_running(task_id)
+        if not store.claim(task_id):
+            return
         raw_result = runner.run(imgs, task_id=task_id, work_root=work_root)
         if "mv_ea" not in raw_result and "ea" in raw_result:
             raw_result["mv_ea"] = raw_result["ea"]
@@ -548,7 +370,7 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
             missing = [key for key in echo_keys if key not in raw_result]
             if missing:
                 raise ValueError(f"Echo runner result is missing: {', '.join(missing)}")
-            result.update(analyze(**{key: raw_result[key] for key in echo_keys}, gls=raw_result.get("gls")))
-        store.complete(task_id, result)
+            result.update(analyze(**{key: raw_result[key] for key in echo_keys}))
+        store.complete(task_id, build_success_outcome(task_id, imgs, result))
     except Exception as exc:
         store.fail(task_id, str(exc))

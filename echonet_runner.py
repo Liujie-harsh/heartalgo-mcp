@@ -60,7 +60,7 @@ SLICE_DIR_MAP = {
 #   "mean_bm"      - B-Mode 取均值 (cm→mm), 如血管类 Aorta/AorticRoot/RVBase/IVC/PA
 #   "stdout_ea"    - MV_EA 终端解析 E_Vel/A_Vel/E/A 三个值, rois 为空
 #   "stdout_vmax"  - Doppler/TDI 终端解析 Peak Velocity, rois 为空
-#   "stdout_tapse" - TAPSE 终端解析位移值, rois 为空
+#   "stdout_tapse" - TAPSE 终端解析位移值并将 cm 转为 mm, rois 为空
 
 DCM_TYPE_TASKS: dict[str, list[dict]] = {
     # ===== 分支1: B-Mode (inference_2D_image.py, CSV 单位 cm → ×10 转 mm) =====
@@ -159,7 +159,7 @@ class EchoNetRunner:
         按 img.dcmType 查 DCM_TYPE_TASKS 表分流推理。
 
         每份 imgId 独立推理, 结果按 {imgId: metrics} 结构返回。
-        顶层主指标 (lvef/lvedd/lvesd/lad/ea/gls) 供 rules.analyze 使用。
+        顶层主指标 (lvef/lvedd/lvesd/lad/mv_ea) 供 rules.analyze 使用。
         per_image 内含该切面的所有指标 (如 PLAX 的 ivs/lvpw/aorta 等)。
 
         PLAX 内部依赖: LVID 必须第一个跑, 产出 ED/ES 帧号供 IVS/LVPW 的 ed_frame 规则使用。
@@ -300,7 +300,8 @@ class EchoNetRunner:
             match = re.search(r"TAPSE\s*[:=]\s*([\d.]+)", stdout or "")
             if not match:
                 raise ValueError(f"未解析到 TAPSE 值, 终端输出: {(stdout or '')[-200:]}")
-            return round(float(match.group(1)), 2), []
+            tapse_cm = float(match.group(1))
+            return round(tapse_cm * 10, 2), []
 
         if rule == "stdout_vmax":
             # Doppler/TDI 脚本输出: Peak Velocity = X cm/s

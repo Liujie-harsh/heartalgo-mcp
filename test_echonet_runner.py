@@ -243,10 +243,10 @@ class TestParseByRule:
             runner._parse_by_rule("stdout_vmax", "TR_Vmax", None, "no output")
 
     def test_stdout_tapse_rule(self, runner):
-        # TAPSE: 位移解析
+        # inference_TAPSE.py 输出 cm；接口统一返回 mm
         stdout = "TAPSE = 1.87"
         value, rois = runner._parse_by_rule("stdout_tapse", "TAPSE", None, stdout)
-        assert value == 1.87
+        assert value == 18.7
         assert rois == []
 
     def test_csv_not_found_raises(self, runner, tmp_path):
@@ -351,6 +351,25 @@ class TestRunDispatch:
         assert per_img["rois"] == []
         # 顶层 mv_ea
         assert result["mv_ea"] == 2.02
+
+    def test_tapse_run_converts_stdout_cm_to_mm(self, runner, tmp_path, monkeypatch):
+        """TAPSE 脚本输出 cm，Runner 对外统一为 mm。"""
+        def fake_run_task(task, dcm_path, img_id, task_id, work_root, gpu_device=None):
+            return None, "TAPSE = 1.87"
+
+        monkeypatch.setattr(runner, "_run_task", fake_run_task)
+
+        imgs = [ImgItem(
+            imgId="tapse-1",
+            imgPath="tapse.dcm",
+            imgType="CARDIAC_ULTRASOUND",
+            dcmType="TAPSE",
+        )]
+        result = runner.run(imgs, task_id="t1", work_root=str(tmp_path))
+
+        per_img = result["echo_per_image"]["tapse-1"]
+        assert per_img["tapse"] == 18.7
+        assert per_img["rois"] == []
 
     def test_single_image_failure_isolated(self, runner, tmp_path, monkeypatch):
         """单图失败记录 error, 不中断其他图 (阶段 2 per-image try/except)。"""

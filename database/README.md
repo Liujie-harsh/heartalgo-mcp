@@ -60,4 +60,38 @@ algorithm_report
 
 队列在 API 进程内运行，不使用外部消息服务。`PYTHON_GPU_IDS=0,1` 时，心超和 ECG-FM 子任务可分别占用空闲 GPU；同一任务的所有子任务结束后再统一返回结果。
 
-注意：进程内队列在服务重启后不会保留未完成任务；MySQL 接入完成后，任务、执行状态与结果将以数据库记录为准。
+注意：进程内队列在服务重启后不会保留未完成任务；任务、输入和报告已可通过
+`MySQLTaskStore` 持久化。服务重启时如何处置数据库中状态为 `1-分析中` 的任务，
+仍需确认业务策略后再实现恢复扫描。
+
+## 启用 MySQLTaskStore
+
+安装数据库依赖：
+
+```powershell
+python -m pip install "SQLAlchemy>=2,<3" "PyMySQL>=1.1,<3"
+```
+
+使用环境变量传入连接信息，避免把密码写进源码、启动脚本或 Git：
+
+```powershell
+$env:TASK_STORE_BACKEND = "mysql"
+$env:DATABASE_URL = "mysql+pymysql://<user>:<url-encoded-password>@<host>:3306/<database>?charset=utf8mb4"
+python main.py --fake
+```
+
+未设置 `TASK_STORE_BACKEND` 时仍使用内存存储，适合不连接数据库的单元测试。
+开发阶段只写 `algorithm_task`、`algorithm_input`、`algorithm_report`；
+`algorithm_execution` 按当前约定建表但暂不写入。
+
+## 真实 MySQL 契约测试
+
+测试必须指向专用测试库，不能指向生产库或共享开发库：
+
+```powershell
+$env:TEST_DATABASE_URL = "mysql+pymysql://<user>:<url-encoded-password>@127.0.0.1:3306/heart_failure_analytics_test?charset=utf8mb4"
+pytest -q test_mysql_task_store.py
+```
+
+测试数据使用随机 `codex_<uuid>_` 前缀并在用例结束后删除。未设置
+`TEST_DATABASE_URL` 时，真实 MySQL 用例会跳过，同时仍执行 SQLite 快速契约测试。
