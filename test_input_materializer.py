@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,6 +70,13 @@ class _UnusedECGRunner:
         raise AssertionError("ECG runner should not be called")
 
 
+class _WritingMaterializer(InputMaterializer):
+    """策略测试用物化器：保留公共 materialize 流程，但不访问真实网络。"""
+
+    def _download(self, source_url: str, destination: Path) -> None:
+        destination.write_bytes(b"private-network-dicom")
+
+
 @pytest.fixture
 def download_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _DownloadHandler)
@@ -120,6 +128,132 @@ def test_http_input_is_materialized_but_result_keeps_original_reference(tmp_path
     assert seen_path.parent.name == "cardiac_ultrasound"
     assert seen_path.name.startswith("dcm-1-")
     assert seen_path.suffix == ".dcm"
+
+
+def test_private_network_policy_allows_rfc1918_url_without_host_allowlist(tmp_path):
+    materializer = _WritingMaterializer(
+        DownloadSettings(access_policy="private_network")
+    )
+    image = ImgItem(
+        imgId="private-dcm",
+        imgPath="http://172.16.32.185:19090/plax.dcm",
+        imgType="CARDIAC_ULTRASOUND",
+        dcmType="PLAX",
+    )
+
+    resolved = materializer.materialize(
+        image, task_id="private-network-task", work_root=str(tmp_path)
+    )
+
+    assert Path(resolved.imgPath).read_bytes() == b"private-network-dicom"
+
+
+def test_private_network_policy_rejects_public_url(tmp_path):
+    materializer = _WritingMaterializer(
+        DownloadSettings(access_policy="private_network")
+    )
+    image = ImgItem(
+        imgId="public-dcm",
+        imgPath="https://8.8.8.8/plax.dcm",
+        imgType="CARDIAC_ULTRASOUND",
+        dcmType="PLAX",
+    )
+
+    with pytest.raises(InputMaterializationError, match="私有网络"):
+        materializer.materialize(
+            image, task_id="public-network-task", work_root=str(tmp_path)
+        )
+
+
+def test_private_network_policy_allows_hostname_when_all_addresses_are_private(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("172.16.32.185", 19090),
+            )
+        ],
+    )
+    materializer = _WritingMaterializer(
+        DownloadSettings(access_policy="private_network")
+    )
+    image = ImgItem(
+        imgId="private-hostname-dcm",
+        imgPath="http://files.hospital.local:19090/plax.dcm",
+        imgType="CARDIAC_ULTRASOUND",
+        dcmType="PLAX",
+    )
+
+    resolved = materializer.materialize(
+        image, task_id="private-hostname-task", work_root=str(tmp_path)
+    )
+
+    assert Path(resolved.imgPath).read_bytes() == b"private-network-dicom"
+
+
+def test_private_network_policy_rejects_hostname_with_any_public_address(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("172.16.32.185", 19090),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("8.8.8.8", 19090),
+            ),
+        ],
+    )
+    materializer = _WritingMaterializer(
+        DownloadSettings(access_policy="private_network")
+    )
+    image = ImgItem(
+        imgId="mixed-hostname-dcm",
+        imgPath="http://files.hospital.local:19090/plax.dcm",
+        imgType="CARDIAC_ULTRASOUND",
+        dcmType="PLAX",
+    )
+
+    with pytest.raises(InputMaterializationError, match="私有网络"):
+        materializer.materialize(
+            image, task_id="mixed-hostname-task", work_root=str(tmp_path)
+        )
+
+
+def test_private_network_policy_is_loaded_from_environment_without_hosts(monkeypatch):
+    monkeypatch.setenv("HTTP_INPUT_ACCESS_POLICY", "private_network")
+    monkeypatch.delenv("HTTP_INPUT_ALLOWED_HOSTS", raising=False)
+
+    settings = DownloadSettings.from_environment()
+
+    assert settings.access_policy == "private_network"
+    assert settings.allowed_authorities == frozenset()
+
+
+def test_private_network_policy_rejects_redirect_to_public_address():
+    materializer = InputMaterializer(
+        DownloadSettings(access_policy="private_network")
+    )
+
+    with pytest.raises(InputMaterializationError, match="私有网络"):
+        materializer._validate_redirect_url("https://8.8.8.8/redirected.dcm")
 
 
 def test_truncated_download_is_rejected_without_leaving_input_file(tmp_path, download_server):

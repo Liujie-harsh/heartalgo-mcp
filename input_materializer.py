@@ -2,9 +2,12 @@
 
 配置环境变量：
 
+``HTTP_INPUT_ACCESS_POLICY``
+    ``allowlist``（默认）要求初始地址匹配精确主机白名单；
+    ``private_network`` 自动允许 RFC 1918 私有 IPv4 地址，无需主机白名单。
 ``HTTP_INPUT_ALLOWED_HOSTS``
     允许下载的精确 ``host`` 或 ``host:port``，多个值用英文逗号分隔。
-    默认空，即远程下载默认关闭；原有本地路径不受影响。
+    仅 ``allowlist`` 策略使用。默认空，即远程下载默认关闭；原有本地路径不受影响。
 ``HTTP_INPUT_MAX_BYTES``
     单个输入文件最大字节数，默认 512 MiB。
 ``HTTP_INPUT_TIMEOUT_SECONDS``
@@ -16,8 +19,11 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
+import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -29,10 +35,26 @@ class InputMaterializationError(RuntimeError):
     """输入引用无法安全物化为本地文件。"""
 
 
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _is_rfc1918(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return isinstance(address, ipaddress.IPv4Address) and any(
+        address in network for network in _RFC1918_NETWORKS
+    )
+
+
 @dataclass(frozen=True)
 class DownloadSettings:
-    """HTTP 输入下载配置；远程主机必须显式加入白名单。"""
+    """HTTP 输入下载配置；默认使用精确白名单，也可允许私有网络。"""
 
+    access_policy: str = "allowlist"
     allowed_authorities: frozenset[str] = frozenset()
     max_bytes: int = 512 * 1024 * 1024
     timeout_seconds: float = 60.0
@@ -40,6 +62,10 @@ class DownloadSettings:
     bearer_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.access_policy not in {"allowlist", "private_network"}:
+            raise ValueError(
+                "HTTP_INPUT_ACCESS_POLICY 必须是 allowlist 或 private_network"
+            )
         if self.max_bytes < 1:
             raise ValueError("HTTP_INPUT_MAX_BYTES 必须大于 0")
         if self.timeout_seconds <= 0:
@@ -58,6 +84,9 @@ class DownloadSettings:
             if item.strip()
         )
         return cls(
+            access_policy=os.environ.get("HTTP_INPUT_ACCESS_POLICY", "allowlist")
+            .strip()
+            .lower(),
             allowed_authorities=hosts,
             max_bytes=int(os.environ.get("HTTP_INPUT_MAX_BYTES", str(512 * 1024 * 1024))),
             timeout_seconds=float(os.environ.get("HTTP_INPUT_TIMEOUT_SECONDS", "60")),
@@ -68,10 +97,12 @@ class DownloadSettings:
 class _RedirectHandler(HTTPRedirectHandler):
     """允许 HTTP(S) 重定向；跨来源跳转时不转发服务凭据。"""
 
+    def __init__(self, validate_target: Callable[[str], None]) -> None:
+        self._validate_target = validate_target
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._validate_target(newurl)
         target = urlsplit(newurl)
-        if target.scheme.lower() not in {"http", "https"}:
-            raise HTTPError(newurl, code, "重定向目标协议不受支持", headers, fp)
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is None:
             return None
@@ -86,10 +117,9 @@ class _RedirectHandler(HTTPRedirectHandler):
 class InputMaterializer:
     """支持本地路径直通，以及受控 HTTP/HTTPS 引用的任务级物化。"""
 
-    _opener = build_opener(_RedirectHandler())
-
     def __init__(self, settings: DownloadSettings | None = None) -> None:
         self.settings = settings or DownloadSettings.from_environment()
+        self._opener = build_opener(_RedirectHandler(self._validate_redirect_url))
 
     def materialize(self, image, *, task_id: str, work_root: str | None):
         try:
@@ -102,7 +132,7 @@ class InputMaterializer:
             raise InputMaterializationError("远程输入下载要求配置任务隔离目录")
 
         try:
-            self._validate_url(parsed)
+            self._validate_url(parsed, enforce_allowlist=True)
             destination = self._destination(image, task_id=task_id, work_root=work_root)
             if destination.is_file() and destination.stat().st_size > 0:
                 return self._with_local_path(image, destination)
@@ -114,7 +144,16 @@ class InputMaterializer:
         except OSError as exc:
             raise InputMaterializationError("远程输入文件物化失败") from exc
 
-    def _validate_url(self, parsed: SplitResult) -> None:
+    def _validate_redirect_url(self, url: str) -> None:
+        try:
+            parsed = urlsplit(url)
+        except ValueError as exc:
+            raise InputMaterializationError("重定向地址格式无效") from exc
+        if parsed.scheme.lower() not in {"http", "https"}:
+            raise InputMaterializationError("重定向目标协议不受支持")
+        self._validate_url(parsed, enforce_allowlist=False)
+
+    def _validate_url(self, parsed: SplitResult, *, enforce_allowlist: bool) -> None:
         if parsed.username is not None or parsed.password is not None:
             raise InputMaterializationError("远程输入地址不允许包含用户凭据")
         try:
@@ -125,8 +164,32 @@ class InputMaterializer:
         if not host:
             raise InputMaterializationError("远程输入地址缺少主机名")
         authority = f"{host}:{port}" if port is not None else host
-        if authority not in self.settings.allowed_authorities:
+        if self.settings.access_policy == "private_network":
+            self._validate_private_network_host(
+                host, port or self._default_port(parsed.scheme)
+            )
+        elif enforce_allowlist and authority not in self.settings.allowed_authorities:
             raise InputMaterializationError("远程输入地址不在允许的下载白名单中")
+
+    @staticmethod
+    def _default_port(scheme: str) -> int:
+        return 443 if scheme.lower() == "https" else 80
+
+    @staticmethod
+    def _validate_private_network_host(host: str, port: int) -> None:
+        try:
+            literal = ipaddress.ip_address(host)
+            addresses = [literal]
+        except ValueError:
+            try:
+                addresses = [
+                    ipaddress.ip_address(item[4][0])
+                    for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                ]
+            except (OSError, ValueError) as exc:
+                raise InputMaterializationError("远程输入地址无法解析") from exc
+        if not addresses or any(not _is_rfc1918(address) for address in addresses):
+            raise InputMaterializationError("远程输入地址不属于允许的私有网络")
 
     def _destination(self, image, *, task_id: str, work_root: str) -> Path:
         safe_task = self._safe_component(task_id, "task")
