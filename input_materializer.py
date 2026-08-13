@@ -79,7 +79,10 @@ class InputMaterializer:
         self.settings = settings or DownloadSettings.from_environment()
 
     def materialize(self, image, *, task_id: str, work_root: str | None):
-        parsed = urlsplit(image.imgPath)
+        try:
+            parsed = urlsplit(image.imgPath)
+        except ValueError as exc:
+            raise InputMaterializationError("远程输入地址格式无效") from exc
         if parsed.scheme.lower() not in {"http", "https"}:
             return image
         if not task_id or not work_root:
@@ -128,8 +131,6 @@ class InputMaterializer:
     @staticmethod
     def _safe_component(value: str, fallback: str) -> str:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value).strip("._")
-        if safe == value and len(safe) <= 80:
-            return safe
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
         return f"{(safe or fallback)[:64]}-{digest}"
 
