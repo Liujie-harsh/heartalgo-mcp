@@ -21,6 +21,7 @@ from task_models import ImgItem
 class _DownloadHandler(BaseHTTPRequestHandler):
     payload = b"downloaded-dicom"
     last_authorization: str | None = None
+    redirect_location = "/ok.dcm"
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler public hook
         type(self).last_authorization = self.headers.get("Authorization")
@@ -29,7 +30,7 @@ class _DownloadHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/redirect.dcm":
             self.send_response(302)
-            self.send_header("Location", "/ok.dcm")
+            self.send_header("Location", type(self).redirect_location)
             self.end_headers()
             return
         payload = {
@@ -74,6 +75,7 @@ def download_server():
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        _DownloadHandler.redirect_location = "/ok.dcm"
         yield f"127.0.0.1:{server.server_port}"
     finally:
         server.shutdown()
@@ -316,18 +318,36 @@ def test_oversized_download_is_rejected_without_partial_file(tmp_path, download_
     assert not list(tmp_path.rglob("*.part"))
 
 
-def test_http_redirect_is_not_followed(tmp_path, download_server):
-    authority = download_server
-    materializer = InputMaterializer(
-        DownloadSettings(allowed_authorities=frozenset({authority}))
-    )
-    image = ImgItem(
-        imgId="dcm-redirect", imgPath=f"http://{authority}/redirect.dcm",
-        imgType="CARDIAC_ULTRASOUND", dcmType="PLAX",
-    )
+def test_http_redirect_to_non_allowlisted_authority_is_followed(tmp_path, download_server):
+    source_authority = download_server
+    target_server = ThreadingHTTPServer(("127.0.0.1", 0), _DownloadHandler)
+    target_thread = Thread(target=target_server.serve_forever, daemon=True)
+    target_thread.start()
+    try:
+        target_authority = f"127.0.0.1:{target_server.server_port}"
+        _DownloadHandler.redirect_location = f"http://{target_authority}/redirect-target.dcm"
+        _DownloadHandler.last_authorization = None
+        materializer = InputMaterializer(
+            DownloadSettings(
+                allowed_authorities=frozenset({source_authority}),
+                bearer_token="source-service-token",
+            )
+        )
+        image = ImgItem(
+            imgId="dcm-redirect", imgPath=f"http://{source_authority}/redirect.dcm",
+            imgType="CARDIAC_ULTRASOUND", dcmType="PLAX",
+        )
 
-    with pytest.raises(InputMaterializationError, match="不允许 HTTP 重定向"):
-        materializer.materialize(image, task_id="task-redirect", work_root=str(tmp_path))
+        resolved = materializer.materialize(
+            image, task_id="task-redirect", work_root=str(tmp_path)
+        )
+
+        assert Path(resolved.imgPath).read_bytes() == _DownloadHandler.payload
+        assert _DownloadHandler.last_authorization is None
+    finally:
+        target_server.shutdown()
+        target_server.server_close()
+        target_thread.join(timeout=5)
 
 
 def test_ecg_download_failure_marks_whole_task_failed(tmp_path):

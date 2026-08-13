@@ -65,15 +65,28 @@ class DownloadSettings:
         )
 
 
-class _NoRedirectHandler(HTTPRedirectHandler):
+class _RedirectHandler(HTTPRedirectHandler):
+    """允许 HTTP(S) 重定向；跨来源跳转时不转发服务凭据。"""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        target = urlsplit(newurl)
+        if target.scheme.lower() not in {"http", "https"}:
+            raise HTTPError(newurl, code, "重定向目标协议不受支持", headers, fp)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        source = urlsplit(req.full_url)
+        if (source.scheme.lower(), source.netloc.lower()) != (
+            target.scheme.lower(), target.netloc.lower()
+        ):
+            redirected.remove_header("Authorization")
+        return redirected
 
 
 class InputMaterializer:
     """支持本地路径直通，以及受控 HTTP/HTTPS 引用的任务级物化。"""
 
-    _opener = build_opener(_NoRedirectHandler())
+    _opener = build_opener(_RedirectHandler())
 
     def __init__(self, settings: DownloadSettings | None = None) -> None:
         self.settings = settings or DownloadSettings.from_environment()
@@ -170,8 +183,6 @@ class InputMaterializer:
             raise
         except HTTPError as exc:
             partial.unlink(missing_ok=True)
-            if 300 <= exc.code < 400:
-                raise InputMaterializationError("远程输入下载不允许 HTTP 重定向") from exc
             raise InputMaterializationError("远程输入文件下载失败") from exc
         except (URLError, OSError, ValueError) as exc:
             partial.unlink(missing_ok=True)
