@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 
 from api import create_app
 from combined_runner import CombinedRunner
-from input_materializer import DownloadSettings, InputMaterializationError, InputMaterializer
+from input_materializer import (
+    DownloadSettings,
+    InputMaterializationError,
+    InputMaterializer,
+    _PrivateNetworkHTTPConnection,
+)
 from task_models import ImgItem
 
 
@@ -235,6 +240,31 @@ def test_private_network_policy_rejects_hostname_with_any_public_address(
         materializer.materialize(
             image, task_id="mixed-hostname-task", work_root=str(tmp_path)
         )
+
+
+def test_private_network_connection_rejects_public_peer_after_private_dns_validation(
+    monkeypatch,
+):
+    class PublicPeerSocket:
+        closed = False
+
+        def getpeername(self):
+            return "8.8.8.8", 80
+
+        def close(self):
+            self.closed = True
+
+    peer_socket = PublicPeerSocket()
+    monkeypatch.setattr(
+        "input_materializer.HTTPConnection.connect",
+        lambda connection: setattr(connection, "sock", peer_socket),
+    )
+    connection = _PrivateNetworkHTTPConnection("files.hospital.local", 80)
+
+    with pytest.raises(InputMaterializationError, match="实际连接.*私有网络"):
+        connection.connect()
+
+    assert peer_socket.closed is True
 
 
 def test_private_network_policy_is_loaded_from_environment_without_hosts(monkeypatch):

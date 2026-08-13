@@ -25,10 +25,18 @@ import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from http.client import HTTPConnection, HTTPSConnection
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 
 class InputMaterializationError(RuntimeError):
@@ -48,6 +56,42 @@ def _is_rfc1918(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return isinstance(address, ipaddress.IPv4Address) and any(
         address in network for network in _RFC1918_NETWORKS
     )
+
+
+def _validate_connected_peer(connection: HTTPConnection | HTTPSConnection) -> None:
+    """在发送 HTTP 请求头前校验实际 TCP 对端，防止 DNS 重绑定。"""
+    try:
+        peer = ipaddress.ip_address(connection.sock.getpeername()[0])
+    except (AttributeError, OSError, ValueError) as exc:
+        connection.close()
+        raise InputMaterializationError("无法确认远程输入连接的实际对端") from exc
+    if not _is_rfc1918(peer):
+        connection.close()
+        raise InputMaterializationError("远程输入实际连接不属于允许的私有网络")
+
+
+class _PrivateNetworkHTTPConnection(HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        _validate_connected_peer(self)
+
+
+class _PrivateNetworkHTTPSConnection(HTTPSConnection):
+    def connect(self) -> None:
+        super().connect()
+        _validate_connected_peer(self)
+
+
+class _PrivateNetworkHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PrivateNetworkHTTPConnection, req)
+
+
+class _PrivateNetworkHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _PrivateNetworkHTTPSConnection, req, context=self._context
+        )
 
 
 @dataclass(frozen=True)
@@ -119,7 +163,16 @@ class InputMaterializer:
 
     def __init__(self, settings: DownloadSettings | None = None) -> None:
         self.settings = settings or DownloadSettings.from_environment()
-        self._opener = build_opener(_RedirectHandler(self._validate_redirect_url))
+        handlers = [_RedirectHandler(self._validate_redirect_url)]
+        if self.settings.access_policy == "private_network":
+            handlers.extend(
+                [
+                    ProxyHandler({}),
+                    _PrivateNetworkHTTPHandler(),
+                    _PrivateNetworkHTTPSHandler(),
+                ]
+            )
+        self._opener = build_opener(*handlers)
 
     def materialize(self, image, *, task_id: str, work_root: str | None):
         try:
