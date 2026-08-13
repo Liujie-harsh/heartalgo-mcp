@@ -19,8 +19,10 @@ from task_models import ImgItem
 
 class _DownloadHandler(BaseHTTPRequestHandler):
     payload = b"downloaded-dicom"
+    last_authorization: str | None = None
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler public hook
+        type(self).last_authorization = self.headers.get("Authorization")
         if self.path == "/missing.dcm":
             self.send_error(404)
             return
@@ -29,11 +31,15 @@ class _DownloadHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/ok.dcm")
             self.end_headers()
             return
+        payload = {
+            "/first.dcm": b"first-dicom",
+            "/second.dcm": b"second-dicom",
+        }.get(self.path, self.payload)
         self.send_response(200)
-        declared_length = len(self.payload) + 10 if self.path == "/truncated.dcm" else len(self.payload)
+        declared_length = len(payload) + 10 if self.path == "/truncated.dcm" else len(payload)
         self.send_header("Content-Length", str(declared_length))
         self.end_headers()
-        self.wfile.write(self.payload)
+        self.wfile.write(payload)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -149,6 +155,103 @@ def test_remote_input_is_rejected_when_host_is_not_allowlisted(tmp_path):
 
     with pytest.raises(InputMaterializationError, match="白名单"):
         materializer.materialize(image, task_id="task-denied", work_root=str(tmp_path))
+
+
+def test_sanitized_input_ids_cannot_reuse_another_inputs_file(tmp_path):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DownloadHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        authority = f"127.0.0.1:{server.server_port}"
+        materializer = InputMaterializer(
+            DownloadSettings(allowed_authorities=frozenset({authority}))
+        )
+        first = ImgItem(
+            imgId="same/id",
+            imgPath=f"http://{authority}/first.dcm",
+            imgType="CARDIAC_ULTRASOUND",
+            dcmType="PLAX",
+        )
+        second = ImgItem(
+            imgId="same?id",
+            imgPath=f"http://{authority}/second.dcm",
+            imgType="CARDIAC_ULTRASOUND",
+            dcmType="PLAX",
+        )
+
+        first_local = materializer.materialize(first, task_id="task-collision", work_root=str(tmp_path))
+        second_local = materializer.materialize(second, task_id="task-collision", work_root=str(tmp_path))
+
+        assert first_local.imgPath != second_local.imgPath
+        assert Path(first_local.imgPath).read_bytes() == b"first-dicom"
+        assert Path(second_local.imgPath).read_bytes() == b"second-dicom"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_echo_filesystem_failure_is_isolated_to_that_input(tmp_path):
+    work_root_file = tmp_path / "not-a-directory"
+    work_root_file.write_bytes(b"occupied")
+    local_dicom = tmp_path / "local-good.dcm"
+    local_dicom.write_bytes(_DownloadHandler.payload)
+    echo_runner = _CapturingEchoRunner()
+    runner = CombinedRunner(
+        echo_runner=echo_runner,
+        ecg_runner=_UnusedECGRunner(),
+        input_materializer=InputMaterializer(
+            DownloadSettings(allowed_authorities=frozenset({"files.example.invalid"}))
+        ),
+    )
+    app = create_app(runner=runner, sync=True, work_root=str(work_root_file))
+
+    with TestClient(app) as client:
+        start = client.post("/heart-algo/task/start", json={
+            "requestId": "request-filesystem-isolation",
+            "sysUserId": "user-1",
+            "taskId": "task-filesystem-isolation",
+            "cardiacUltrasound": [{
+                "dcmType": "PLAX",
+                "dcms": [
+                    {"dcmId": "dcm-local", "dcmPath": str(local_dicom)},
+                    {
+                        "dcmId": "dcm-filesystem-error",
+                        "dcmPath": "https://files.example.invalid/studies/2.dcm",
+                    },
+                ],
+            }],
+            "ecg": [],
+        })
+
+    assert start.json()["taskState"] == 2
+
+
+def test_configured_bearer_token_is_sent_to_download_service(tmp_path):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DownloadHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        authority = f"127.0.0.1:{server.server_port}"
+        _DownloadHandler.last_authorization = None
+        materializer = InputMaterializer(DownloadSettings(
+            allowed_authorities=frozenset({authority}),
+            bearer_token="service-secret",
+        ))
+        image = ImgItem(
+            imgId="dcm-auth",
+            imgPath=f"http://{authority}/authenticated.dcm",
+            imgType="CARDIAC_ULTRASOUND",
+            dcmType="PLAX",
+        )
+
+        materializer.materialize(image, task_id="task-auth", work_root=str(tmp_path))
+
+        assert _DownloadHandler.last_authorization == "Bearer service-secret"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_existing_local_path_remains_compatible(tmp_path):

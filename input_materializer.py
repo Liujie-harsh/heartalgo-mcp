@@ -9,13 +9,16 @@
     单个输入文件最大字节数，默认 512 MiB。
 ``HTTP_INPUT_TIMEOUT_SECONDS``
     单次 HTTP 请求 socket 超时秒数，默认 60 秒。
+``HTTP_INPUT_BEARER_TOKEN``
+    可选的服务间 Bearer Token，仅作为请求头发送，不写入文件路径或日志。
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import SplitResult, urlsplit
@@ -34,6 +37,7 @@ class DownloadSettings:
     max_bytes: int = 512 * 1024 * 1024
     timeout_seconds: float = 60.0
     chunk_bytes: int = 1024 * 1024
+    bearer_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_bytes < 1:
@@ -42,6 +46,8 @@ class DownloadSettings:
             raise ValueError("HTTP_INPUT_TIMEOUT_SECONDS 必须大于 0")
         if self.chunk_bytes < 1:
             raise ValueError("chunk_bytes 必须大于 0")
+        if self.bearer_token and ("\r" in self.bearer_token or "\n" in self.bearer_token):
+            raise ValueError("HTTP_INPUT_BEARER_TOKEN 不能包含换行符")
 
     @classmethod
     def from_environment(cls) -> "DownloadSettings":
@@ -55,6 +61,7 @@ class DownloadSettings:
             allowed_authorities=hosts,
             max_bytes=int(os.environ.get("HTTP_INPUT_MAX_BYTES", str(512 * 1024 * 1024))),
             timeout_seconds=float(os.environ.get("HTTP_INPUT_TIMEOUT_SECONDS", "60")),
+            bearer_token=os.environ.get("HTTP_INPUT_BEARER_TOKEN") or None,
         )
 
 
@@ -78,13 +85,18 @@ class InputMaterializer:
         if not task_id or not work_root:
             raise InputMaterializationError("远程输入下载要求配置任务隔离目录")
 
-        self._validate_url(parsed)
-        destination = self._destination(image, task_id=task_id, work_root=work_root)
-        if destination.is_file() and destination.stat().st_size > 0:
-            return self._with_local_path(image, destination)
+        try:
+            self._validate_url(parsed)
+            destination = self._destination(image, task_id=task_id, work_root=work_root)
+            if destination.is_file() and destination.stat().st_size > 0:
+                return self._with_local_path(image, destination)
 
-        self._download(image.imgPath, destination)
-        return self._with_local_path(image, destination)
+            self._download(image.imgPath, destination)
+            return self._with_local_path(image, destination)
+        except InputMaterializationError:
+            raise
+        except OSError as exc:
+            raise InputMaterializationError("远程输入文件物化失败") from exc
 
     def _validate_url(self, parsed: SplitResult) -> None:
         if parsed.username is not None or parsed.password is not None:
@@ -116,7 +128,10 @@ class InputMaterializer:
     @staticmethod
     def _safe_component(value: str, fallback: str) -> str:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value).strip("._")
-        return safe or fallback
+        if safe == value and len(safe) <= 80:
+            return safe
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        return f"{(safe or fallback)[:64]}-{digest}"
 
     @staticmethod
     def _with_local_path(image, destination: Path):
@@ -127,7 +142,10 @@ class InputMaterializer:
     def _download(self, source_url: str, destination: Path) -> None:
         partial = destination.with_suffix(destination.suffix + ".part")
         partial.unlink(missing_ok=True)
-        request = Request(source_url, headers={"User-Agent": "heart-algo-input-materializer/1"})
+        headers = {"User-Agent": "heart-algo-input-materializer/1"}
+        if self.settings.bearer_token:
+            headers["Authorization"] = f"Bearer {self.settings.bearer_token}"
+        request = Request(source_url, headers=headers)
         try:
             with self._opener.open(request, timeout=self.settings.timeout_seconds) as response:
                 content_length = response.headers.get("Content-Length")
