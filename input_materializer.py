@@ -1,0 +1,159 @@
+"""将远程算法输入下载到任务隔离目录，再交给只接受本地文件的 runner。
+
+配置环境变量：
+
+``HTTP_INPUT_ALLOWED_HOSTS``
+    允许下载的精确 ``host`` 或 ``host:port``，多个值用英文逗号分隔。
+    默认空，即远程下载默认关闭；原有本地路径不受影响。
+``HTTP_INPUT_MAX_BYTES``
+    单个输入文件最大字节数，默认 512 MiB。
+``HTTP_INPUT_TIMEOUT_SECONDS``
+    单次 HTTP 请求 socket 超时秒数，默认 60 秒。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import SplitResult, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class InputMaterializationError(RuntimeError):
+    """输入引用无法安全物化为本地文件。"""
+
+
+@dataclass(frozen=True)
+class DownloadSettings:
+    """HTTP 输入下载配置；远程主机必须显式加入白名单。"""
+
+    allowed_authorities: frozenset[str] = frozenset()
+    max_bytes: int = 512 * 1024 * 1024
+    timeout_seconds: float = 60.0
+    chunk_bytes: int = 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.max_bytes < 1:
+            raise ValueError("HTTP_INPUT_MAX_BYTES 必须大于 0")
+        if self.timeout_seconds <= 0:
+            raise ValueError("HTTP_INPUT_TIMEOUT_SECONDS 必须大于 0")
+        if self.chunk_bytes < 1:
+            raise ValueError("chunk_bytes 必须大于 0")
+
+    @classmethod
+    def from_environment(cls) -> "DownloadSettings":
+        raw_hosts = os.environ.get("HTTP_INPUT_ALLOWED_HOSTS", "")
+        hosts = frozenset(
+            item.strip().lower().rstrip(".")
+            for item in raw_hosts.split(",")
+            if item.strip()
+        )
+        return cls(
+            allowed_authorities=hosts,
+            max_bytes=int(os.environ.get("HTTP_INPUT_MAX_BYTES", str(512 * 1024 * 1024))),
+            timeout_seconds=float(os.environ.get("HTTP_INPUT_TIMEOUT_SECONDS", "60")),
+        )
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class InputMaterializer:
+    """支持本地路径直通，以及受控 HTTP/HTTPS 引用的任务级物化。"""
+
+    _opener = build_opener(_NoRedirectHandler())
+
+    def __init__(self, settings: DownloadSettings | None = None) -> None:
+        self.settings = settings or DownloadSettings.from_environment()
+
+    def materialize(self, image, *, task_id: str, work_root: str | None):
+        parsed = urlsplit(image.imgPath)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return image
+        if not task_id or not work_root:
+            raise InputMaterializationError("远程输入下载要求配置任务隔离目录")
+
+        self._validate_url(parsed)
+        destination = self._destination(image, task_id=task_id, work_root=work_root)
+        if destination.is_file() and destination.stat().st_size > 0:
+            return self._with_local_path(image, destination)
+
+        self._download(image.imgPath, destination)
+        return self._with_local_path(image, destination)
+
+    def _validate_url(self, parsed: SplitResult) -> None:
+        if parsed.username is not None or parsed.password is not None:
+            raise InputMaterializationError("远程输入地址不允许包含用户凭据")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise InputMaterializationError("远程输入地址端口无效") from exc
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host:
+            raise InputMaterializationError("远程输入地址缺少主机名")
+        authority = f"{host}:{port}" if port is not None else host
+        if authority not in self.settings.allowed_authorities:
+            raise InputMaterializationError("远程输入地址不在允许的下载白名单中")
+
+    def _destination(self, image, *, task_id: str, work_root: str) -> Path:
+        safe_task = self._safe_component(task_id, "task")
+        safe_image = self._safe_component(image.imgId, "input")
+        if image.imgType == "CARDIAC_ULTRASOUND":
+            category, suffix = "cardiac_ultrasound", ".dcm"
+        elif image.imgType == "ECG":
+            category, suffix = "ecg", ".xml"
+        else:
+            raise InputMaterializationError("输入文件类型不受支持")
+        destination = Path(work_root) / safe_task / "inputs" / category / f"{safe_image}{suffix}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    @staticmethod
+    def _safe_component(value: str, fallback: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value).strip("._")
+        return safe or fallback
+
+    @staticmethod
+    def _with_local_path(image, destination: Path):
+        data = image.model_dump() if hasattr(image, "model_dump") else image.dict()
+        data["imgPath"] = str(destination)
+        return type(image)(**data)
+
+    def _download(self, source_url: str, destination: Path) -> None:
+        partial = destination.with_suffix(destination.suffix + ".part")
+        partial.unlink(missing_ok=True)
+        request = Request(source_url, headers={"User-Agent": "heart-algo-input-materializer/1"})
+        try:
+            with self._opener.open(request, timeout=self.settings.timeout_seconds) as response:
+                content_length = response.headers.get("Content-Length")
+                expected_length = int(content_length) if content_length is not None else None
+                if expected_length is not None and expected_length > self.settings.max_bytes:
+                    raise InputMaterializationError("远程输入文件超过允许大小")
+                total = 0
+                with partial.open("xb") as output:
+                    while chunk := response.read(self.settings.chunk_bytes):
+                        total += len(chunk)
+                        if total > self.settings.max_bytes:
+                            raise InputMaterializationError("远程输入文件超过允许大小")
+                        output.write(chunk)
+                if total == 0:
+                    raise InputMaterializationError("远程输入文件为空")
+                if expected_length is not None and total != expected_length:
+                    raise InputMaterializationError("远程输入文件下载不完整")
+            os.replace(partial, destination)
+        except InputMaterializationError:
+            partial.unlink(missing_ok=True)
+            raise
+        except HTTPError as exc:
+            partial.unlink(missing_ok=True)
+            if 300 <= exc.code < 400:
+                raise InputMaterializationError("远程输入下载不允许 HTTP 重定向") from exc
+            raise InputMaterializationError("远程输入文件下载失败") from exc
+        except (URLError, OSError, ValueError) as exc:
+            partial.unlink(missing_ok=True)
+            raise InputMaterializationError("远程输入文件下载失败") from exc

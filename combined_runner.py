@@ -9,6 +9,8 @@ from queue import Queue
 from threading import Thread
 from typing import TYPE_CHECKING, Any, Iterator
 
+from input_materializer import InputMaterializationError, InputMaterializer
+
 if TYPE_CHECKING:
     from api import ImgItem
 
@@ -79,10 +81,17 @@ class GPUResourcePool:
 
 class CombinedRunner:
     """心超与 ECG 任务可占用不同空闲 GPU；全部完成后合并为一个 work 的结果。"""
-    def __init__(self, echo_runner, ecg_runner, gpu_pool: GPUResourcePool | None = None):
+    def __init__(
+        self,
+        echo_runner,
+        ecg_runner,
+        gpu_pool: GPUResourcePool | None = None,
+        input_materializer: InputMaterializer | None = None,
+    ):
         self.echo_runner = echo_runner
         self.ecg_runner = ecg_runner
         self.gpu_pool = gpu_pool
+        self.input_materializer = input_materializer or InputMaterializer()
 
     @staticmethod
     def _call(runner, imgs: list[ImgItem], task_id: str, work_root: str | None, gpu_id: str | None) -> dict:
@@ -98,16 +107,34 @@ class CombinedRunner:
             return self._call(runner, imgs, task_id, work_root, gpu_id)
 
     def run(self, imgs: list[ImgItem], task_id: str = "", work_root: str | None = None) -> dict:
-        echo_images = [image for image in imgs if image.imgType == "CARDIAC_ULTRASOUND"]
-        ecg_images = [image for image in imgs if image.imgType == "ECG"]
+        materialized = []
+        echo_download_errors: dict[str, dict] = {}
+        for image in imgs:
+            try:
+                materialized.append(
+                    self.input_materializer.materialize(image, task_id=task_id, work_root=work_root)
+                )
+            except InputMaterializationError as exc:
+                if image.imgType == "ECG":
+                    raise
+                echo_download_errors[image.imgId] = {"error": str(exc), "rois": []}
+        echo_images = [image for image in materialized if image.imgType == "CARDIAC_ULTRASOUND"]
+        ecg_images = [image for image in materialized if image.imgType == "ECG"]
         if echo_images and ecg_images and self.gpu_pool is not None:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="heart-algo-model") as executor:
                 echo = executor.submit(self._run_with_gpu, self.echo_runner, echo_images, task_id, work_root)
                 ecg = executor.submit(self._run_with_gpu, self.ecg_runner, ecg_images, task_id, work_root)
-                return {**echo.result(), **ecg.result()}
+                result = {**echo.result(), **ecg.result()}
+                return self._with_download_errors(result, echo_download_errors)
         result: dict = {}
         if echo_images:
             result.update(self._run_with_gpu(self.echo_runner, echo_images, task_id, work_root))
         if ecg_images:
             result.update(self._run_with_gpu(self.ecg_runner, ecg_images, task_id, work_root))
+        return self._with_download_errors(result, echo_download_errors)
+
+    @staticmethod
+    def _with_download_errors(result: dict, errors: dict[str, dict]) -> dict:
+        if errors:
+            result.setdefault("echo_per_image", {}).update(errors)
         return result
