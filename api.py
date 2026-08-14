@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from rules import analyze
 from combined_runner import InProcessTaskQueue
+from swagger_examples import START_REQUEST_EXAMPLE
 from task_models import ImgItem
 from task_outcome import build_success_outcome
 from task_store import InMemoryTaskStore, TaskOwnershipError, TaskStore
@@ -61,6 +62,8 @@ class EcgItem(BaseModel):
 
 class StartRequest(BaseModel):
     """v3 start 请求: 心超按切面分组 + ECG 列表。"""
+
+    model_config = {"json_schema_extra": {"example": START_REQUEST_EXAMPLE}}
 
     requestId: str
     sysUserId: str
