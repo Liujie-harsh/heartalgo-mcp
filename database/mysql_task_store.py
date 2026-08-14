@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import IntegrityError
 
 from task_models import ImgItem
-from task_store import TaskOwnershipError
+from task_store import RecoverableTask, TaskOwnershipError
 
 
 class MySQLTaskStore:
@@ -289,6 +290,67 @@ class MySQLTaskStore:
                 {"task_id": task_id, "reason": reason},
             )
             return True
+
+    def recover_pending_tasks(self, stale_running_seconds: int) -> list[RecoverableTask]:
+        """终止超时运行任务，并返回持久化排队任务供新进程重新投递。"""
+        if stale_running_seconds < 0:
+            raise ValueError("stale_running_seconds 不能小于 0")
+        stale_before = datetime.now() - timedelta(seconds=stale_running_seconds)
+        interrupted_reason = "任务因算法服务中断而终止，请重新提交"
+        with self._engine.begin() as connection:
+            stale_rows = connection.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM algorithm_task
+                    WHERE task_state = 1
+                      AND COALESCE(started_at, created_at) <= :stale_before
+                    """
+                ),
+                {"stale_before": stale_before},
+            ).mappings().all()
+            stale_ids = [row["id"] for row in stale_rows]
+            for task_db_id in stale_ids:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE algorithm_task
+                        SET task_state = 3, failed_reason = :reason,
+                            finished_at = CURRENT_TIMESTAMP
+                        WHERE id = :task_db_id AND task_state = 1
+                        """
+                    ),
+                    {"task_db_id": task_db_id, "reason": interrupted_reason},
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE algorithm_input
+                        SET input_state = 3, failed_reason = :reason
+                        WHERE task_db_id = :task_db_id AND input_state = 1
+                        """
+                    ),
+                    {"task_db_id": task_db_id, "reason": interrupted_reason},
+                )
+
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT task_id
+                    FROM algorithm_task
+                    WHERE task_state = 0
+                    ORDER BY created_at, id
+                    """
+                )
+            ).mappings().all()
+            recovered: list[RecoverableTask] = []
+            for row in rows:
+                task = self._load_task(connection, row["task_id"])
+                if task is not None:
+                    recovered.append(
+                        RecoverableTask(task_id=row["task_id"], images=task["imgs"])
+                    )
+            return recovered
 
     def _load_task(
         self,

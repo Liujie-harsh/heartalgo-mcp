@@ -187,3 +187,38 @@ def test_failure_is_persistent_and_terminal(store_and_engine):
     assert persisted["taskState"] == 3
     assert persisted["failedReason"] == "runner failed"
 
+
+def test_recovery_returns_queued_tasks_for_redelivery(store_and_engine):
+    store, _, prefix = store_and_engine
+    task_id = f"{prefix}task-queued-recovery"
+    store.create_or_get(
+        task_id,
+        _images(),
+        f"{prefix}request-queued-recovery",
+        "user-a",
+    )
+
+    recovered = store.recover_pending_tasks(stale_running_seconds=3600)
+
+    assert [(item.task_id, [image.imgId for image in item.images]) for item in recovered] == [
+        (task_id, ["dcm-1", "ecg-1"]),
+    ]
+
+
+def test_recovery_terminates_stale_running_tasks(store_and_engine):
+    store, _, prefix = store_and_engine
+    task_id = f"{prefix}task-stale-recovery"
+    store.create_or_get(
+        task_id,
+        _images(),
+        f"{prefix}request-stale-recovery",
+        "user-a",
+    )
+    assert store.claim(task_id) is True
+
+    recovered = store.recover_pending_tasks(stale_running_seconds=0)
+    task = store.get(task_id)
+
+    assert recovered == []
+    assert task["taskState"] == 3
+    assert task["failedReason"] == "任务因算法服务中断而终止，请重新提交"

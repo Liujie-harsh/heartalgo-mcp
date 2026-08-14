@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from threading import RLock
 from typing import Any, Optional, Protocol
 
 
 class TaskOwnershipError(RuntimeError):
     """taskId 已属于其他用户。"""
+
+
+@dataclass(frozen=True)
+class RecoverableTask:
+    """服务重启后需要重新投递到执行队列的持久化任务。"""
+
+    task_id: str
+    images: list[Any]
 
 
 class TaskStore(Protocol):
@@ -30,6 +40,8 @@ class TaskStore(Protocol):
     def complete(self, task_id: str, result: dict) -> bool: ...
 
     def fail(self, task_id: str, reason: str) -> bool: ...
+
+    def recover_pending_tasks(self, stale_running_seconds: int) -> list[RecoverableTask]: ...
 
 
 class InMemoryTaskStore:
@@ -73,6 +85,7 @@ class InMemoryTaskStore:
                 "imgs": imgs,
                 "requestId": request_id,
                 "sysUserId": sys_user_id,
+                "startedAt": None,
             }
             self._tasks[task_id] = task
             if request_id and sys_user_id:
@@ -96,6 +109,7 @@ class InMemoryTaskStore:
             if self._tasks[task_id]["taskState"] != 0:
                 return False
             self._tasks[task_id]["taskState"] = 1
+            self._tasks[task_id]["startedAt"] = datetime.now()
             return True
 
     def complete(self, task_id: str, result: dict) -> bool:
@@ -113,3 +127,25 @@ class InMemoryTaskStore:
             self._tasks[task_id]["taskState"] = 3
             self._tasks[task_id]["failedReason"] = reason
             return True
+
+    def recover_pending_tasks(self, stale_running_seconds: int) -> list[RecoverableTask]:
+        """终止超时运行任务，并返回仍在内存中的排队任务。"""
+        if stale_running_seconds < 0:
+            raise ValueError("stale_running_seconds 不能小于 0")
+        stale_before = datetime.now() - timedelta(seconds=stale_running_seconds)
+        interrupted_reason = "任务因算法服务中断而终止，请重新提交"
+        with self._lock:
+            for task in self._tasks.values():
+                started_at = task.get("startedAt")
+                if (
+                    task["taskState"] == 1
+                    and started_at is not None
+                    and started_at <= stale_before
+                ):
+                    task["taskState"] = 3
+                    task["failedReason"] = interrupted_reason
+            return [
+                RecoverableTask(task_id=task_id, images=list(task["imgs"]))
+                for task_id, task in self._tasks.items()
+                if task["taskState"] == 0
+            ]

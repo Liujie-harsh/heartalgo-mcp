@@ -138,8 +138,11 @@ def test_run_rejects_missing_file(tmp_path):
         python_executable="py",
     )
 
-    with pytest.raises(ECGInputError, match="不存在"):
+    with pytest.raises(ECGInputError, match="不存在") as captured:
         runner.run([ImgItem(imgId="ecg-1", imgPath=str(tmp_path / "missing.xml"), imgType="ECG")])
+
+    assert str(captured.value) == "ECG 输入文件不存在"
+    assert str(tmp_path) not in str(captured.value)
 
 
 # ────────────────── parse_ecg_xml ──────────────────

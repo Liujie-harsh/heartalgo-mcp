@@ -14,11 +14,12 @@
   - ecg_measurements / ecg_patient_info: 结构化返回 (改进 #8)
   - safe_task / safe_img: taskId/imgId 路径 sanitize
   - 多 ECG 拒绝: 每任务仅允许 1 个 ECG (handoff L300)
-  - _cmd stderr 透传: 子进程失败时把 stderr 透传到 ValueError
+  - 子进程错误脱敏: 已知输入错误翻译为中文，未知 stderr 不向 API 暴露
 """
 from __future__ import annotations
 
 import math
+import logging
 import os
 import re
 import subprocess
@@ -30,24 +31,41 @@ from pathlib import Path
 
 import pandas as pd
 
+from algorithm_errors import AlgorithmError
 from api import ImgItem
 from config import ECGFMConfig
 
 
-class ECGInputError(ValueError):
+logger = logging.getLogger(__name__)
+
+
+class ECGInputError(AlgorithmError, ValueError):
     """ECG XML 文件或其波形数据不符合模型输入要求。"""
 
+    code = "ECG_INVALID_INPUT"
+    default_message = "ECG 输入文件不符合模型要求"
 
-class ECGConversionError(RuntimeError):
+
+class ECGConversionError(AlgorithmError, RuntimeError):
     """ECG XML 转换为 ECG-FM MAT 文件失败。"""
 
+    code = "ECG_CONVERSION_FAILED"
+    default_message = "ECG 数据转换失败"
 
-class ECGInferenceError(RuntimeError):
+
+class ECGInferenceError(AlgorithmError, RuntimeError):
     """ECG-FM 未产生可用的预测结果。"""
 
+    code = "ECG_INFERENCE_FAILED"
+    default_message = "ECG 模型推理失败"
 
-class ECGTimeoutError(TimeoutError):
+
+class ECGTimeoutError(AlgorithmError, TimeoutError):
     """ECG 数据转换或模型推理超过时间限制。"""
+
+    code = "ECG_TIMEOUT"
+    default_message = "ECG 模型处理超时"
+    retryable = True
 
 
 # ECG-FM 疾病标签英文 → 中文
@@ -216,7 +234,8 @@ class ECGFMRunner:
             if source.suffix.lower() != ".xml":
                 raise ECGInputError("ECG 输入文件格式不支持：仅支持 XML 文件")
             if not source.is_file():
-                raise ECGInputError(f"ECG 输入文件不存在：{source}")
+                logger.warning("ECG 输入文件不存在 path=%s", source)
+                raise ECGInputError("ECG 输入文件不存在")
             # 缺少测量/患者标签不是失败；解析成功时按 {} / null 返回。
             try:
                 measurements[image.imgId], patient_info[image.imgId] = parse_ecg_xml(source)
@@ -296,6 +315,12 @@ class ECGFMRunner:
             raise ECGTimeoutError(f"ECG {stage}超时（超过 {timeout} 秒）") from error
         except subprocess.CalledProcessError as error:
             detail = (error.stderr or error.stdout or "").strip()
+            logger.error(
+                "ECG 子进程失败 stage=%s return_code=%s stderr=%s",
+                stage,
+                error.returncode,
+                detail[-4000:],
+            )
             if stage == "数据转换":
                 raise ECGConversionError(ECGFMRunner._conversion_error_message(detail)) from error
             raise ECGInferenceError("ECG 模型推理失败") from error

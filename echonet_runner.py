@@ -17,14 +17,26 @@ EchoNet 真实推理 runner (生产用, 需 torch+GPU)。
   work_root/task_id/outputs/<imgId>/echo/<weights或metric>/out_*.avi|jpg
   产物永久保留, 不自动清理。
 """
+import logging
 import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
 import pandas as pd
+from algorithm_errors import AlgorithmError
 from api import ImgItem
 from config import MeasurementConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+class EchoInferenceError(AlgorithmError, RuntimeError):
+    """心超测量脚本未成功产生可用结果。"""
+
+    code = "ECHO_INFERENCE_FAILED"
+    default_message = "心超模型推理失败"
 
 
 # ────────────────── 切面→子目录映射表 ──────────────────
@@ -215,7 +227,17 @@ class EchoNetRunner:
                     img_rois.extend(rois)
             except Exception as error:
                 # 单图失败记录 error, 不中断其他图 (一个 Doppler 失败不应让已成功的 PLAX 陪葬)
-                img_metrics["error"] = f"{dcm_type} 推理失败: {error}"
+                logger.exception(
+                    "心超单图推理失败 task_id=%s img_id=%s dcm_type=%s",
+                    task_id,
+                    img.imgId,
+                    dcm_type,
+                )
+                img_metrics["error"] = (
+                    str(error)
+                    if isinstance(error, AlgorithmError)
+                    else f"{dcm_type} 模型推理失败"
+                )
                 img_metrics["rois"] = img_rois
                 per_image[img.imgId] = img_metrics
                 continue
@@ -252,10 +274,30 @@ class EchoNetRunner:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.script_dir, env={**os.environ, **({"CUDA_VISIBLE_DEVICES": str(gpu_device)} if gpu_device is not None else {})})
         except subprocess.CalledProcessError as e:
-            stderr_tail = (e.stderr or "")[-500:]
-            raise RuntimeError(f"脚本 {task['script']} 退出码={e.returncode}, stderr: {stderr_tail}") from e
+            detail = (e.stderr or e.stdout or "").strip()
+            logger.error(
+                "心超子进程失败 script=%s return_code=%s stderr=%s",
+                task["script"],
+                e.returncode,
+                detail[-4000:],
+            )
+            raise EchoInferenceError(self._script_error_message(detail)) from e
         csv_path = out_file.replace(ext, "_distance.csv") if ext == ".avi" else None
         return csv_path, result.stdout
+
+    @staticmethod
+    def _script_error_message(detail: str) -> str:
+        """把稳定的子进程错误特征翻译为可公开中文消息。"""
+        normalized = detail.lower()
+        if "out of memory" in normalized:
+            return "心超模型显存不足，请稍后重试"
+        if "no such file or directory" in normalized or "file not found" in normalized:
+            return "心超输入或模型文件不存在"
+        if "y0" in normalized and (
+            "out of" in normalized or "outside" in normalized or "range" in normalized
+        ):
+            return "心超图像超出模型支持范围"
+        return "心超模型推理失败"
 
     def _task_output_dir(self, img_id: str, task_id: str, work_root: str | None, sub: str) -> str:
         """构造任务隔离输出目录: <work_root>/<task_id>/outputs/<img_id>/echo/<sub>/。

@@ -12,6 +12,7 @@
   输入 mm, 内部转 cm
 """
 import os
+import subprocess
 import pandas as pd
 import pytest
 
@@ -378,7 +379,9 @@ class TestRunDispatch:
         def fake_run_task(task, dcm_path, img_id, task_id, work_root, gpu_device=None):
             call_count[0] += 1
             if img_id == "bad":
-                raise RuntimeError("phase_estimate failed")
+                raise RuntimeError(
+                    "stderr: password=secret C:/private/phase_estimate.py"
+                )
             return _make_csv(tmp_path, f"out_{task['metric']}_distance.csv",
                              [3.5, 5.06, 4.0, 3.16]), ""
 
@@ -393,7 +396,31 @@ class TestRunDispatch:
         result = runner.run(imgs, task_id="t1", work_root=str(tmp_path))
 
         # bad 图有 error, good 图正常
-        assert "error" in result["echo_per_image"]["bad"]
+        assert result["echo_per_image"]["bad"]["error"] == "PLAX 模型推理失败"
         assert "lvedd" in result["echo_per_image"]["good"]
         # 顶层主指标来自 good 图 (后跑覆盖)
         assert result["lvedd"] == 50.6
+
+    def test_gpu_oom_stderr_becomes_safe_chinese_error(self, runner, tmp_path, monkeypatch):
+        def fail_subprocess(command, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=command,
+                stderr="CUDA out of memory at C:/private/model.py",
+            )
+
+        monkeypatch.setattr("echonet_runner.subprocess.run", fail_subprocess)
+        result = runner.run(
+            [
+                ImgItem(
+                    imgId="oom",
+                    imgPath="oom.dcm",
+                    imgType="CARDIAC_ULTRASOUND",
+                    dcmType="PLAX",
+                )
+            ],
+            task_id="task-oom",
+            work_root=str(tmp_path),
+        )
+
+        assert result["echo_per_image"]["oom"]["error"] == "心超模型显存不足，请稍后重试"

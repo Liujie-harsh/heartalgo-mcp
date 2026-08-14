@@ -2,7 +2,7 @@
 心衰诊断 API (异步任务模式, 支持心超 + ECG 混合任务)。
 
 遵循《图像算法分析接口协议 v3》:
-  POST /heart-algo/task/start  → 启动分析任务 (BackgroundTasks 异步)
+  POST /heart-algo/task/start  → 启动分析任务（进程内队列异步）
   POST /heart-algo/task/result → 查询任务结果
 
 v3 请求体按切面分组:
@@ -17,17 +17,21 @@ v3 响应体心超与 ECG 分离:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Literal, Optional, Protocol
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from rules import analyze
+from algorithm_errors import to_public_error
 from combined_runner import InProcessTaskQueue
-from swagger_examples import START_REQUEST_EXAMPLE
 from task_models import ImgItem
 from task_outcome import build_success_outcome
 from task_store import InMemoryTaskStore, TaskOwnershipError, TaskStore
+
+
+logger = logging.getLogger(__name__)
 
 
 # ────────────────── v3 请求体模型 ──────────────────
@@ -62,8 +66,6 @@ class EcgItem(BaseModel):
 
 class StartRequest(BaseModel):
     """v3 start 请求: 心超按切面分组 + ECG 列表。"""
-
-    model_config = {"json_schema_extra": {"example": START_REQUEST_EXAMPLE}}
 
     requestId: str
     sysUserId: str
@@ -201,23 +203,37 @@ def create_app(
     store: TaskStore | None = None,
     task_queue: InProcessTaskQueue | None = None,
     queue_worker_count: int = 1,
+    stale_running_seconds: int = 0,
 ) -> FastAPI:
     """创建 FastAPI app。
 
     Args:
         runner: 推理器 (FakeRunner 测试 / CombinedRunner 生产)
-        sync: True=start 同步执行 (测试用); False=BackgroundTasks 异步 (生产用)
+        sync: True=start 同步执行（测试用）；False=进程内队列异步（生产用）
         work_root: 任务产物根目录 (TASK_WORK_ROOT), 传给 runner 做任务隔离
         store: 任务存储 (测试可注入; 默认内存 TaskStore)
-        ecgfm_health_check: ECG-FM 健康检查回调
+        stale_running_seconds: 启动时判定遗留运行中任务的宽限秒数
     """
+    if stale_running_seconds < 0:
+        raise ValueError("stale_running_seconds 不能小于 0")
     app = FastAPI(title="心衰诊断算法服务")
     app.state.runner = runner
     app.state.store = store or InMemoryTaskStore()
     app.state.sync = sync
     app.state.work_root = work_root
+    app.state.stale_running_seconds = stale_running_seconds
     app.state.owns_task_queue = task_queue is None
     app.state.task_queue = task_queue or InProcessTaskQueue(worker_count=queue_worker_count)
+
+    @app.on_event("startup")
+    def _recover_pending_tasks() -> None:
+        for pending in app.state.store.recover_pending_tasks(stale_running_seconds):
+            app.state.task_queue.enqueue(
+                _execute,
+                app,
+                pending.task_id,
+                pending.images,
+            )
 
     if app.state.owns_task_queue:
         @app.on_event("shutdown")
@@ -376,4 +392,10 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
             result.update(analyze(**{key: raw_result[key] for key in echo_keys}))
         store.complete(task_id, build_success_outcome(task_id, imgs, result))
     except Exception as exc:
-        store.fail(task_id, str(exc))
+        public_error = to_public_error(exc)
+        logger.exception(
+            "算法任务执行失败 task_id=%s error_code=%s",
+            task_id,
+            public_error.code,
+        )
+        store.fail(task_id, public_error.message)

@@ -1,6 +1,6 @@
 ﻿"""心衰诊断算法服务启动入口（心超 + ECG 混合任务）。
 
-配置优先级：CLI 参数 >config.py 内置默认值。
+配置优先级：CLI 参数/显式参数 > 环境变量 > config.py 内置默认值。
 """
 from __future__ import annotations
 
@@ -20,6 +20,22 @@ ALGORITHM_DIR = Path(__file__).resolve().parent
 WORK_DIR = ALGORITHM_DIR.parent
 
 
+def _resolve_cors_origins(
+    configured: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    origins = configured
+    if origins is None:
+        origins = tuple(
+            item.strip()
+            for item in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",")
+            if item.strip()
+        )
+    resolved = tuple(origin.strip() for origin in origins if origin.strip())
+    if "*" in resolved:
+        raise ValueError("CORS_ALLOWED_ORIGINS 不允许使用通配符 *")
+    return resolved
+
+
 def build_app(
     use_fake: bool = False,
     script_dir: str | None = None,
@@ -33,8 +49,11 @@ def build_app(
     task_work_root: str | None = None,
     task_store_backend: str | None = None,
     database_url: str | None = None,
+    cors_allowed_origins: list[str] | tuple[str, ...] | None = None,
+    stale_running_seconds: int | None = None,
 ):
     """构建 app，注入实际 runner、任务目录与两个模型的健康检查回调。"""
+    origins = _resolve_cors_origins(cors_allowed_origins)
     work_root = task_work_root or os.environ.get("TASK_WORK_ROOT")
     if not work_root and not use_fake:
         print("[WARN] 未指定 TASK_WORK_ROOT (--task-work-root 或 TASK_WORK_ROOT 环境变量)，"
@@ -82,20 +101,27 @@ def build_app(
         task_store = MySQLTaskStore(resolved_database_url)
 
     queue_workers = int(os.environ.get("PYTHON_QUEUE_WORKERS", "1"))
+    resolved_stale_seconds = (
+        stale_running_seconds
+        if stale_running_seconds is not None
+        else int(os.environ.get("TASK_STALE_RUNNING_SECONDS", "0"))
+    )
     app = create_app(
         runner=runner,
         sync=False,
         work_root=work_root,
         store=task_store,
         queue_worker_count=queue_workers,
+        stale_running_seconds=resolved_stale_seconds,
     )
     app.state.task_store_backend = backend
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["POST"],
-        allow_headers=["*"],
-    )
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(origins),
+            allow_methods=["POST"],
+            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        )
     return app
 
 
@@ -124,6 +150,8 @@ if __name__ == "__main__":
                         help="任务存储后端（默认读取 TASK_STORE_BACKEND，未配置时为 memory）")
     parser.add_argument("--database-url", type=str, default=None,
                         help="MySQL SQLAlchemy URL；建议通过 DATABASE_URL 环境变量传入")
+    parser.add_argument("--stale-running-seconds", type=int, default=None,
+                        help="启动时判定遗留运行中任务的超时秒数（单实例默认 0，立即终止旧状态 1）")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -141,6 +169,7 @@ if __name__ == "__main__":
         task_work_root=args.task_work_root,
         task_store_backend=args.task_store,
         database_url=args.database_url,
+        stale_running_seconds=args.stale_running_seconds,
     )
     measurement_dir = (
         args.measurement_script_dir or args.script_dir

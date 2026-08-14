@@ -25,6 +25,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api import create_app, FakeRunner
+from ecgfm_runner import ECGConversionError
+from task_models import ImgItem
+from task_store import InMemoryTaskStore
 
 
 @pytest.fixture
@@ -105,6 +108,34 @@ def _v3_mixed_start_body(task_id="task-mixed", request_id="req-mixed"):
             {"ecgId": "ecg-1", "ecgPath": "/data/ecg.xml"}
         ],
     }
+
+
+def test_app_startup_redelivers_persisted_queued_tasks(fake_echo_runner):
+    store = InMemoryTaskStore()
+    store.create_or_get(
+        "task-recovered",
+        [
+            ImgItem(
+                imgId="img-recovered",
+                imgPath="/data/recovered.dcm",
+                imgType="CARDIAC_ULTRASOUND",
+                dcmType="PLAX",
+            )
+        ],
+        request_id="req-recovered",
+        sys_user_id="user-1",
+    )
+    app = create_app(
+        runner=fake_echo_runner,
+        sync=False,
+        store=store,
+        stale_running_seconds=3600,
+    )
+
+    with TestClient(app):
+        app.state.task_queue.join()
+
+    assert store.get("task-recovered")["taskState"] == 2
 
 
 # ────────────────── start 端点 ──────────────────
@@ -191,6 +222,47 @@ class TestStartTask:
         resp = client.post("/heart-algo/task/start", json=_v3_start_body())
         body = resp.json()
         assert "failedReason" not in body
+
+    def test_unexpected_runner_error_is_not_exposed(self):
+        class BrokenRunner:
+            def run(self, imgs, task_id="", work_root=None):
+                raise RuntimeError(
+                    "stderr: password=secret C:/private/model.py line 99"
+                )
+
+        app = create_app(runner=BrokenRunner(), sync=True)
+        with TestClient(app) as failed_client:
+            failed_client.post("/heart-algo/task/start", json=_v3_start_body())
+            response = failed_client.post(
+                "/heart-algo/task/result",
+                json={
+                    "requestId": "req-result",
+                    "sysUserId": "user-1",
+                    "taskId": "task-1",
+                },
+            )
+
+        body = response.json()
+        serialized = response.text
+        assert body["failedReason"] == "算法服务内部错误，请联系管理员"
+        assert "secret" not in serialized
+        assert "C:/private" not in serialized
+
+    def test_known_runner_error_keeps_its_safe_message(self):
+        class InvalidEcgRunner:
+            def run(self, imgs, task_id="", work_root=None):
+                raise ECGConversionError(
+                    "ECG 输入不完整：十二导联采样点数量不一致"
+                )
+
+        app = create_app(runner=InvalidEcgRunner(), sync=True)
+        with TestClient(app) as failed_client:
+            response = failed_client.post(
+                "/heart-algo/task/start",
+                json=_v3_start_body(),
+            )
+
+        assert response.json()["resultMsg"] == "ECG 输入不完整：十二导联采样点数量不一致"
 
 
 # ────────────────── result 端点 ──────────────────
@@ -390,7 +462,7 @@ class TestInferenceFailure:
     """推理失败时任务标记为失败。"""
 
     def test_runner_exception_marks_task_failed(self):
-        # runner 抛异常 → taskState=3 + failedReason 含错误信息
+        # 未分类异常只返回稳定公共消息，原始细节留在服务日志
         failing_runner = FakeRunner(metrics={})
         failing_runner.run = lambda imgs, task_id="", work_root=None: (_ for _ in ()).throw(RuntimeError("DICOM 解析失败"))
         app = create_app(runner=failing_runner, sync=True)
@@ -402,7 +474,8 @@ class TestInferenceFailure:
         })
         body = resp.json()
         assert body["taskState"] == 3
-        assert "DICOM 解析失败" in body["failedReason"]
+        assert body["failedReason"] == "算法服务内部错误，请联系管理员"
+        assert "DICOM 解析失败" not in resp.text
 
     def test_failure_payload_has_cu_sub_reports(self):
         # 失败时仍按文件返回 CU-SUB/ECG 报告 (含 error 字段)
