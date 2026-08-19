@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import argparse
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import FakeRunner, create_app
+from case_api import install_case_routes
+from case_store import FileCaseStore
 from config import ECGFMConfig, MeasurementConfig
 from combined_runner import CombinedRunner, GPUResourcePool
 
@@ -51,6 +54,8 @@ def build_app(
     database_url: str | None = None,
     cors_allowed_origins: list[str] | tuple[str, ...] | None = None,
     stale_running_seconds: int | None = None,
+    case_storage_root: str | None = None,
+    mcp_enabled: bool | None = None,
 ):
     """构建 app，注入实际 runner、任务目录与两个模型的健康检查回调。"""
     origins = _resolve_cors_origins(cors_allowed_origins)
@@ -115,12 +120,49 @@ def build_app(
         stale_running_seconds=resolved_stale_seconds,
     )
     app.state.task_store_backend = backend
+    resolved_case_root = (
+        case_storage_root
+        or os.environ.get("CASE_STORAGE_ROOT")
+        or str(Path(work_root) / "cases" if work_root else ALGORITHM_DIR / ".case-data")
+    )
+    case_store = FileCaseStore.from_environment(resolved_case_root)
+    install_case_routes(app, case_store)
+    app.state.case_storage_root = str(case_store.root)
+
+    resolved_mcp_enabled = mcp_enabled
+    if resolved_mcp_enabled is None:
+        resolved_mcp_enabled = os.environ.get("MCP_ENABLED", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    if resolved_mcp_enabled:
+        from mcp_server import build_mcp
+
+        mcp_server = build_mcp(app)
+        mcp_app = mcp_server.streamable_http_app(streamable_http_path="/")
+        original_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def combined_lifespan(current_app):
+            async with original_lifespan(current_app):
+                async with mcp_server.session_manager.run():
+                    yield
+
+        app.router.lifespan_context = combined_lifespan
+        app.mount("/mcp", mcp_app)
+        app.state.mcp_server = mcp_server
+    app.state.mcp_enabled = resolved_mcp_enabled
+
     if origins:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=list(origins),
-            allow_methods=["POST"],
-            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+            allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=[
+                "Authorization", "Content-Type", "Last-Event-ID", "Mcp-Method",
+                "Mcp-Name", "Mcp-Protocol-Version", "Mcp-Session-Id",
+                "X-Request-ID",
+            ],
+            expose_headers=["Mcp-Session-Id"],
         )
     return app
 
@@ -152,6 +194,10 @@ if __name__ == "__main__":
                         help="MySQL SQLAlchemy URL；建议通过 DATABASE_URL 环境变量传入")
     parser.add_argument("--stale-running-seconds", type=int, default=None,
                         help="启动时判定遗留运行中任务的超时秒数（单实例默认 0，立即终止旧状态 1）")
+    parser.add_argument("--case-storage-root", type=str, default=None,
+                        help="上传病例与资产的持久化根目录（支持 CASE_STORAGE_ROOT）")
+    parser.add_argument("--mcp", action=argparse.BooleanOptionalAction, default=None,
+                        help="启用或关闭 /mcp 端点（默认读取 MCP_ENABLED，缺省为启用）")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
@@ -170,6 +216,8 @@ if __name__ == "__main__":
         task_store_backend=args.task_store,
         database_url=args.database_url,
         stale_running_seconds=args.stale_running_seconds,
+        case_storage_root=args.case_storage_root,
+        mcp_enabled=args.mcp,
     )
     measurement_dir = (
         args.measurement_script_dir or args.script_dir
@@ -183,6 +231,8 @@ if __name__ == "__main__":
     print(f"[启动] fake={args.fake} | measurement_script_dir={measurement_dir}")
     print(f"  task_store         : {app.state.task_store_backend}")
     print(f"  work_root          : {args.task_work_root or os.environ.get('TASK_WORK_ROOT')}")
+    print(f"  case_storage_root  : {app.state.case_storage_root}")
+    print(f"  mcp_enabled        : {app.state.mcp_enabled}")
     if not args.fake:
         print(f"  Measurement python : {measurement_python}")
         print(f"  ECG project        : {args.ecg_project_dir or os.environ.get('ECGFM_PROJECT_DIR') or ECGFMConfig.DEFAULT_PROJECT_DIR}")
