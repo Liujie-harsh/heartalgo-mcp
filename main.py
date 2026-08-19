@@ -15,6 +15,7 @@ from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from algorithm_version import resolve_algorithm_version
 from api import FakeRunner, create_app
 from case_api import install_case_routes
 from case_store import FileCaseStore
@@ -47,6 +48,7 @@ def build_app(
     script_dir: str | None = None,
     measurement_script_dir: str | None = None,
     measurement_python: str | None = None,
+    measurement_timeout_seconds: int | None = None,
     ecg_project_dir: str | None = None,
     ecg_checkpoint: str | None = None,
     ecg_python: str | None = None,
@@ -63,6 +65,7 @@ def build_app(
     allow_volatile_task_store: bool | None = None,
 ):
     """构建 app，注入实际 runner、任务目录与两个模型的健康检查回调。"""
+    algorithm_version = resolve_algorithm_version(use_fake=use_fake)
     origins = _resolve_cors_origins(cors_allowed_origins)
     work_root = task_work_root or os.environ.get("TASK_WORK_ROOT")
     if not work_root and not use_fake:
@@ -92,6 +95,7 @@ def build_app(
         measurement_config = MeasurementConfig.resolve(
             script_dir=measurement_script_dir or script_dir,
             python_executable=measurement_python,
+            timeout_seconds=measurement_timeout_seconds,
         )
         ecg_runner = ECGFMRunner(config=ecg_config, work_root=work_root)
         echo_runner = EchoNetRunner(config=measurement_config)
@@ -133,6 +137,7 @@ def build_app(
         store=task_store,
         queue_worker_count=queue_workers,
         stale_running_seconds=resolved_stale_seconds,
+        algorithm_version=algorithm_version,
     )
     app.state.task_store_backend = backend
     resolved_case_root = (
@@ -246,6 +251,8 @@ if __name__ == "__main__":
                         help="Measurement 推理脚本目录（优先于 --script-dir；支持 MEASUREMENT_SCRIPT_DIR）")
     parser.add_argument("--measurement-python", type=str, default=None,
                         help="Measurement 运行 Python（支持 MEASUREMENT_PYTHON）")
+    parser.add_argument("--measurement-timeout-seconds", type=int, default=900,
+                        help="Measurement 单子任务超时秒数")
     parser.add_argument("--ecg-project-dir", type=str, default=None,
                         help="ECG-FM 项目目录（支持 ECGFM_PROJECT_DIR）")
     parser.add_argument("--ecg-checkpoint", type=str, default=None,
@@ -277,6 +284,7 @@ if __name__ == "__main__":
         script_dir=args.script_dir,
         measurement_script_dir=args.measurement_script_dir,
         measurement_python=args.measurement_python,
+        measurement_timeout_seconds=args.measurement_timeout_seconds,
         ecg_project_dir=args.ecg_project_dir,
         ecg_checkpoint=args.ecg_checkpoint,
         ecg_python=args.ecg_python,
@@ -303,6 +311,7 @@ if __name__ == "__main__":
     print(f"  work_root          : {args.task_work_root or os.environ.get('TASK_WORK_ROOT')}")
     print(f"  case_storage_root  : {app.state.case_storage_root}")
     print(f"  mcp_enabled        : {app.state.mcp_enabled}")
+    print(f"  algorithm_version  : {app.state.algorithm_version}")
     if not args.fake:
         print(f"  Measurement python : {measurement_python}")
         print(f"  ECG project        : {args.ecg_project_dir or os.environ.get('ECGFM_PROJECT_DIR') or ECGFMConfig.DEFAULT_PROJECT_DIR}")

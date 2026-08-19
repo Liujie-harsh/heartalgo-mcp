@@ -23,9 +23,17 @@ def _echo_rois(result: dict, img_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def build_success_outcome(task_id: str, images: list[ImgItem], result: dict) -> dict:
+def build_success_outcome(
+    task_id: str,
+    images: list[ImgItem],
+    result: dict,
+    *,
+    algorithm_version: str | None = None,
+) -> dict:
     """构建可直接写入 algorithm_report 的成功任务输出。"""
-    algorithm_version = os.environ.get("ALGORITHM_VERSION", "unknown")
+    algorithm_version = algorithm_version or os.environ.get(
+        "ALGORITHM_VERSION", "unknown"
+    )
     reports: list[dict] = []
     cardiac_ultrasound: list[dict] = []
     ecg: list[dict] = []

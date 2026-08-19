@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+from xml.parsers import expat
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -232,6 +233,8 @@ class FileCaseStore:
             if total == 0:
                 raise CaseStoreError("上传文件为空")
             self._validate_content(modality, bytes(head))
+            if modality == "ECG":
+                self._validate_ecg_xml_file(partial)
 
             asset = {
                 "assetId": asset_id,
@@ -390,8 +393,38 @@ class FileCaseStore:
         if modality == "CARDIAC_ULTRASOUND":
             if len(head) < 132 or head[128:132] != b"DICM":
                 raise CaseStoreError("心超文件不是受支持的 DICOM Part 10 文件")
-        elif not head.lstrip().startswith(b"<"):
-            raise CaseStoreError("ECG 文件不是 XML")
+        else:
+            xml_head = head[3:] if head.startswith(b"\xef\xbb\xbf") else head
+            if not xml_head.lstrip().startswith(b"<"):
+                raise CaseStoreError("ECG 文件不是 XML")
+
+    @staticmethod
+    def _validate_ecg_xml_file(path: Path) -> None:
+        """流式验证完整 XML，避免只凭文件头接受截断或伪造内容。"""
+        parser = expat.ParserCreate()
+        root_name: str | None = None
+
+        def reject_declaration(*_args) -> None:
+            raise CaseStoreError("ECG XML 不允许 DTD 或实体声明")
+
+        def capture_root(name: str, _attributes) -> None:
+            nonlocal root_name
+            if root_name is None:
+                root_name = name.rsplit(":", 1)[-1]
+
+        parser.StartElementHandler = capture_root
+        parser.StartDoctypeDeclHandler = reject_declaration
+        parser.EntityDeclHandler = reject_declaration
+        parser.UnparsedEntityDeclHandler = reject_declaration
+        parser.ExternalEntityRefHandler = reject_declaration
+        parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        try:
+            with path.open("rb") as source:
+                parser.ParseFile(source)
+        except (OSError, expat.ExpatError) as exc:
+            raise CaseStoreError("ECG XML 格式无效") from exc
+        if root_name not in {"AnnotatedECG", "ECG"}:
+            raise CaseStoreError("ECG XML 根元素不受支持")
 
     def _case_path(self, case_id: str) -> Path:
         return self.root / case_id / "case.json"

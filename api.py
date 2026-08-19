@@ -204,6 +204,7 @@ def create_app(
     task_queue: InProcessTaskQueue | None = None,
     queue_worker_count: int = 1,
     stale_running_seconds: int = 0,
+    algorithm_version: str | None = None,
 ) -> FastAPI:
     """创建 FastAPI app。
 
@@ -221,6 +222,7 @@ def create_app(
     app.state.store = store or InMemoryTaskStore()
     app.state.sync = sync
     app.state.work_root = work_root
+    app.state.algorithm_version = algorithm_version
     app.state.stale_running_seconds = stale_running_seconds
     app.state.owns_task_queue = task_queue is None
     app.state.task_queue = task_queue or InProcessTaskQueue(worker_count=queue_worker_count)
@@ -390,7 +392,15 @@ def _execute(app: FastAPI, task_id: str, imgs: list[ImgItem]) -> None:
             if missing:
                 raise ValueError(f"Echo runner result is missing: {', '.join(missing)}")
             result.update(analyze(**{key: raw_result[key] for key in echo_keys}))
-        store.complete(task_id, build_success_outcome(task_id, imgs, result))
+        store.complete(
+            task_id,
+            build_success_outcome(
+                task_id,
+                imgs,
+                result,
+                algorithm_version=getattr(app.state, "algorithm_version", None),
+            ),
+        )
     except Exception as exc:
         public_error = to_public_error(exc)
         logger.exception(

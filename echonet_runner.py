@@ -272,7 +272,26 @@ class EchoNetRunner:
         cmd += task["extra"]
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, cwd=self.script_dir, env={**os.environ, **({"CUDA_VISIBLE_DEVICES": str(gpu_device)} if gpu_device is not None else {})})
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=self.script_dir,
+                timeout=self.config.timeout_seconds,
+                env={
+                    **os.environ,
+                    **(
+                        {"CUDA_VISIBLE_DEVICES": str(gpu_device)}
+                        if gpu_device is not None
+                        else {}
+                    ),
+                },
+            )
+        except subprocess.TimeoutExpired as error:
+            raise EchoInferenceError(
+                f"{task['metric']} 心超推理超时（超过 {self.config.timeout_seconds} 秒）"
+            ) from error
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or e.stdout or "").strip()
             logger.error(

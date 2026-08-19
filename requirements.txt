@@ -1,7 +1,9 @@
 fastapi==0.141.1
 mcp==2.0.0
 pandas==2.3.0
+pydicom==2.4.4
 pydantic==2.13.4
+psutil==7.0.0
 PyMySQL==1.2.0
 python-multipart==0.0.9
 SQLAlchemy==2.0.27

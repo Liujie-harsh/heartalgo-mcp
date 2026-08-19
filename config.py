@@ -69,18 +69,31 @@ class MeasurementConfig:
     """Measurement 心超模型配置。"""
     script_dir: Path
     python_executable: str
+    timeout_seconds: int = 900
 
     # Measurement 项目目录：需包含心超推理脚本。
     DEFAULT_SCRIPT_DIR: ClassVar[Path] = Path(r"G:\meaurements\measurements\Measurement")
     # Measurement 推理使用的 Python 解释器。
     DEFAULT_PYTHON_EXECUTABLE: ClassVar[str] = "python"
+    DEFAULT_TIMEOUT_SECONDS: ClassVar[int] = 900
 
     @classmethod
     def resolve(cls, *, script_dir: str | Path | None = None,
-                python_executable: str | None = None) -> "MeasurementConfig":
+                python_executable: str | None = None,
+                timeout_seconds: int | None = None) -> "MeasurementConfig":
         """使用 CLI 覆盖值；未传入时返回本文件默认配置。"""
-        return cls(Path(script_dir).expanduser() if script_dir else cls.DEFAULT_SCRIPT_DIR,
-                   python_executable or cls.DEFAULT_PYTHON_EXECUTABLE)
+        resolved_timeout = (
+            cls.DEFAULT_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else int(timeout_seconds)
+        )
+        if resolved_timeout < 1:
+            raise ValueError("Measurement 推理超时必须大于 0")
+        return cls(
+            Path(script_dir).expanduser() if script_dir else cls.DEFAULT_SCRIPT_DIR,
+            python_executable or cls.DEFAULT_PYTHON_EXECUTABLE,
+            resolved_timeout,
+        )
 
 
 
