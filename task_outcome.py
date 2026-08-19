@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from metric_catalog import METRIC_META
@@ -24,6 +25,7 @@ def _echo_rois(result: dict, img_id: str) -> list[dict[str, Any]]:
 
 def build_success_outcome(task_id: str, images: list[ImgItem], result: dict) -> dict:
     """构建可直接写入 algorithm_report 的成功任务输出。"""
+    algorithm_version = os.environ.get("ALGORITHM_VERSION", "unknown")
     reports: list[dict] = []
     cardiac_ultrasound: list[dict] = []
     ecg: list[dict] = []
@@ -34,6 +36,7 @@ def build_success_outcome(task_id: str, images: list[ImgItem], result: dict) -> 
         if image.imgType == "ECG":
             report_id = f"{task_id}:{image.imgId}:ecg"
             payload = {
+                "algorithmVersion": algorithm_version,
                 "ecgId": image.imgId,
                 "patientInfo": result.get("ecg_patient_info", {}).get(image.imgId, {}),
                 "measurements": result.get("ecg_measurements", {}).get(image.imgId, {}),
@@ -71,7 +74,11 @@ def build_success_outcome(task_id: str, images: list[ImgItem], result: dict) -> 
             meta = METRIC_META.get(key)
             measurements[key] = {"value": value, **meta} if meta else {"value": value}
 
-        payload = {"dcmId": image.imgId, "measurements": measurements}
+        payload = {
+            "dcmId": image.imgId,
+            "measurements": measurements,
+            "algorithmVersion": algorithm_version,
+        }
         if per_image.get("skipReason"):
             payload["skipReason"] = per_image["skipReason"]
         if per_image.get("error"):
@@ -107,7 +114,11 @@ def build_success_outcome(task_id: str, images: list[ImgItem], result: dict) -> 
         reports.append({
             "reportId": f"{task_id}:cu-summary",
             "reportType": "CU-SUMMARY",
-            "reportResult": {"taskId": task_id, "measurements": summary_measurements},
+            "reportResult": {
+                "taskId": task_id,
+                "measurements": summary_measurements,
+                "algorithmVersion": algorithm_version,
+            },
             "inputId": None,
             "roiData": None,
         })

@@ -23,3 +23,19 @@ METRIC_META: dict[str, dict[str, str]] = {
     "tdi_medial": {"name_cn": "二尖瓣环间隔侧 e'", "unit": "cm/s", "reference": "≥7"},
     "tapse": {"name_cn": "TAPSE", "unit": "mm", "reference": "≥17"},
 }
+
+# MCP 能力发现和上传校验共用这一份切面→指标映射，避免两处能力声明漂移。
+VIEW_METRICS: dict[str, tuple[str, ...]] = {
+    "PLAX": ("lvedd", "lvesd", "lvef", "ivs", "lvpw", "lad", "aorta", "aorticroot"),
+    "A4C": ("rvbase",),
+    "Subcostal": ("ivc",),
+    "RVOT": ("pa",),
+    "MV_EA": ("mv_e", "mv_a", "mv_ea"),
+    "AV_Vmax": ("av_vmax",),
+    "TR_Vmax": ("tr_vmax",),
+    "MR_Vmax": ("mr_vmax",),
+    "LVOT_Vmax": ("lvot_vmax",),
+    "TDI_Medial": ("tdi_medial",),
+    "TDI_Lateral": ("tdi_lateral",),
+    "TAPSE": ("tapse",),
+}

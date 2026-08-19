@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api import FakeRunner, create_app
 from case_api import install_case_routes
@@ -56,6 +59,8 @@ def build_app(
     stale_running_seconds: int | None = None,
     case_storage_root: str | None = None,
     mcp_enabled: bool | None = None,
+    case_auth_required: bool | None = None,
+    allow_volatile_task_store: bool | None = None,
 ):
     """构建 app，注入实际 runner、任务目录与两个模型的健康检查回调。"""
     origins = _resolve_cors_origins(cors_allowed_origins)
@@ -96,6 +101,16 @@ def build_app(
     backend = (task_store_backend or os.environ.get("TASK_STORE_BACKEND", "memory")).lower()
     if backend not in {"memory", "mysql"}:
         raise ValueError("TASK_STORE_BACKEND must be 'memory' or 'mysql'")
+    resolved_allow_volatile = allow_volatile_task_store
+    if resolved_allow_volatile is None:
+        resolved_allow_volatile = os.environ.get(
+            "ALLOW_VOLATILE_CASE_TASKS", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    if not use_fake and backend == "memory" and not resolved_allow_volatile:
+        raise ValueError(
+            "可靠病例闭环要求 TASK_STORE_BACKEND=mysql；"
+            "仅本地临时调试可设置 ALLOW_VOLATILE_CASE_TASKS=true"
+        )
     task_store = None
     if backend == "mysql":
         resolved_database_url = database_url or os.environ.get("DATABASE_URL")
@@ -126,18 +141,73 @@ def build_app(
         or str(Path(work_root) / "cases" if work_root else ALGORITHM_DIR / ".case-data")
     )
     case_store = FileCaseStore.from_environment(resolved_case_root)
-    install_case_routes(app, case_store)
+    resolved_case_auth_required = case_auth_required
+    if resolved_case_auth_required is None:
+        configured_auth = os.environ.get("CASE_AUTH_REQUIRED")
+        resolved_case_auth_required = (
+            configured_auth.strip().lower() in {"1", "true", "yes", "on"}
+            if configured_auth is not None
+            else not use_fake
+        )
+    allow_insecure_case_api = os.environ.get(
+        "ALLOW_INSECURE_CASE_API", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not use_fake and not resolved_case_auth_required and not allow_insecure_case_api:
+        raise ValueError(
+            "生产病例 API 必须启用身份验证；仅隔离调试可设置 "
+            "ALLOW_INSECURE_CASE_API=true"
+        )
+    trusted_proxy_secret = os.environ.get("CASE_TRUSTED_PROXY_SECRET")
+    service_user_id = os.environ.get("MCP_SERVICE_USER_ID", "mcp-service")
+    if not use_fake:
+        @app.on_event("startup")
+        def acquire_case_store_lock() -> None:
+            # 必须在 worker 启动（fork 之后）获取，不能在 build_app/preload 阶段获取。
+            case_store.acquire_instance_lock()
+    try:
+        install_case_routes(
+            app,
+            case_store,
+            require_authenticated_user=resolved_case_auth_required,
+            trusted_proxy_secret=trusted_proxy_secret,
+            service_user_id=service_user_id,
+        )
+    except Exception:
+        case_store.close_instance_lock()
+        raise
+
+    @app.on_event("shutdown")
+    def close_case_store_lock() -> None:
+        case_store.close_instance_lock()
     app.state.case_storage_root = str(case_store.root)
 
     resolved_mcp_enabled = mcp_enabled
     if resolved_mcp_enabled is None:
-        resolved_mcp_enabled = os.environ.get("MCP_ENABLED", "true").strip().lower() in {
+        resolved_mcp_enabled = os.environ.get("MCP_ENABLED", "false").strip().lower() in {
             "1", "true", "yes", "on",
         }
     if resolved_mcp_enabled:
         from mcp_server import build_mcp
 
-        mcp_server = build_mcp(app)
+        mcp_shared_secret = os.environ.get("MCP_SHARED_SECRET")
+        if not use_fake and not mcp_shared_secret:
+            raise ValueError("生产启用 MCP 时必须配置 MCP_SHARED_SECRET")
+
+        if mcp_shared_secret:
+            expected_authorization = f"Bearer {mcp_shared_secret}"
+
+            @app.middleware("http")
+            async def authenticate_mcp(request: Request, call_next):
+                if request.url.path.startswith("/mcp"):
+                    supplied = request.headers.get("Authorization", "")
+                    if not secrets.compare_digest(supplied, expected_authorization):
+                        return JSONResponse(
+                            status_code=401,
+                            content={"detail": "MCP 身份验证失败"},
+                        )
+                return await call_next(request)
+
+        mcp_server = build_mcp(app, service_user_id=service_user_id)
         mcp_app = mcp_server.streamable_http_app(streamable_http_path="/")
         original_lifespan = app.router.lifespan_context
 
@@ -197,8 +267,8 @@ if __name__ == "__main__":
     parser.add_argument("--case-storage-root", type=str, default=None,
                         help="上传病例与资产的持久化根目录（支持 CASE_STORAGE_ROOT）")
     parser.add_argument("--mcp", action=argparse.BooleanOptionalAction, default=None,
-                        help="启用或关闭 /mcp 端点（默认读取 MCP_ENABLED，缺省为启用）")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+                        help="启用或关闭 /mcp 端点（默认读取 MCP_ENABLED，缺省为关闭）")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 

@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import hashlib
-import os
+import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -41,12 +52,31 @@ class ReviewDiagnosisRequest(BaseModel):
     comment: str = Field(default="", max_length=2000)
 
 
+@dataclass(frozen=True)
+class _AuthContext:
+    user_id: str | None
+    roles: frozenset[str]
+
+
 def _raise_http(exc: CaseStoreError) -> None:
     if isinstance(exc, CaseNotFoundError):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if isinstance(exc, CaseConflictError):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _effective_user(
+    declared_user: str,
+    authenticated_user: str | None,
+    require_authenticated_user: bool,
+) -> str:
+    """把业务所有权绑定到网关注入的已验证主体，拒绝请求体覆盖身份。"""
+    if require_authenticated_user and not authenticated_user:
+        raise HTTPException(status_code=401, detail="缺少已验证用户身份")
+    if authenticated_user and authenticated_user != declared_user:
+        raise HTTPException(status_code=403, detail="请求用户与已验证身份不一致")
+    return authenticated_user or declared_user
 
 
 def _select_assets(metadata: dict, requested_ids: list[str] | None) -> list[dict]:
@@ -148,8 +178,16 @@ def _structured_result(
         "cardiacUltrasound": echo,
         "ecg": ecg,
         "inputs": inputs,
-        "algorithmVersion": os.environ.get("ALGORITHM_VERSION", "unknown"),
-        "requiresClinicianReview": review is None,
+        "algorithmVersion": next(
+            (
+                item.get("reportResult", {}).get("algorithmVersion")
+                for item in outcome.get("reports", [])
+                if item.get("reportResult", {}).get("algorithmVersion")
+            ),
+            "unknown",
+        ),
+        "reviewStatus": review["decision"] if review else "pending",
+        "requiresClinicianReview": review is None or review["decision"] != "approved",
         "review": review,
     }
 
@@ -161,6 +199,7 @@ def submit_case_diagnosis(
     request_id: str,
     sys_user_id: str,
     asset_ids: list[str] | None = None,
+    task_id_prefix: str = "diagnosis",
 ) -> dict:
     """通过共享任务队列提交病例；HTTP 与 MCP 共用这一入口。"""
     try:
@@ -169,13 +208,24 @@ def submit_case_diagnosis(
         _raise_http(exc)
     assets = _select_assets(metadata, asset_ids)
     images = _images_from_assets(assets)
-    task_id = f"diagnosis-{uuid4().hex}"
+    selected_asset_ids = [image.imgId for image in images]
+    try:
+        diagnosis, diagnosis_created = case_store.reserve_diagnosis(
+            case_id,
+            sys_user_id,
+            f"{task_id_prefix}-{uuid4().hex}",
+            request_id,
+            selected_asset_ids,
+        )
+    except CaseStoreError as exc:
+        _raise_http(exc)
+    task_id = diagnosis["taskId"]
     scoped_request_id = "case-" + hashlib.sha256(
         f"{case_id}\0{request_id}".encode("utf-8")
     ).hexdigest()
     store: TaskStore = app.state.store
     try:
-        actual_task_id, task, created = store.create_or_get(
+        actual_task_id, task, task_created = store.create_or_get(
             task_id,
             images,
             request_id=scoped_request_id,
@@ -183,14 +233,10 @@ def submit_case_diagnosis(
         )
     except TaskOwnershipError as exc:
         raise HTTPException(status_code=409, detail="诊断任务标识冲突") from exc
-    case_store.record_diagnosis(
-        case_id,
-        sys_user_id,
-        actual_task_id,
-        request_id,
-        [image.imgId for image in task["imgs"]],
-    )
-    if created:
+    if [image.imgId for image in task["imgs"]] != selected_asset_ids:
+        raise HTTPException(status_code=409, detail="诊断任务标识已用于不同输入")
+    case_store.mark_diagnosis_submitted(case_id, sys_user_id, actual_task_id)
+    if task_created:
         if app.state.sync:
             _execute(app, actual_task_id, images)
         else:
@@ -201,7 +247,7 @@ def submit_case_diagnosis(
         "status": {0: "queued", 1: "processing", 2: "completed", 3: "failed"}[
             task["taskState"]
         ],
-        "created": created,
+        "created": diagnosis_created,
     }
 
 
@@ -226,9 +272,82 @@ def get_case_diagnosis_result(
     return _structured_result(case_id, task_id, task, metadata)
 
 
-def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
+def install_case_routes(
+    app: FastAPI,
+    case_store: FileCaseStore,
+    *,
+    require_authenticated_user: bool = False,
+    trusted_proxy_secret: str | None = None,
+    service_user_id: str = "mcp-service",
+) -> None:
     """把病例闭环 API 安装到现有算法 FastAPI 应用。"""
     app.state.case_store = case_store
+    app.state.case_auth_required = require_authenticated_user
+    if require_authenticated_user and not trusted_proxy_secret:
+        raise ValueError("启用病例鉴权时必须配置 CASE_TRUSTED_PROXY_SECRET")
+
+    def authenticated_context(
+        authenticated_user: str | None = Header(None, alias="X-Authenticated-User"),
+        authenticated_roles: str = Header("", alias="X-Authenticated-Roles"),
+        proxy_secret: str | None = Header(None, alias="X-Auth-Proxy-Secret"),
+    ) -> _AuthContext:
+        if require_authenticated_user:
+            if not proxy_secret or not secrets.compare_digest(
+                proxy_secret, trusted_proxy_secret or ""
+            ):
+                raise HTTPException(status_code=401, detail="请求未经过受信身份网关")
+            if not authenticated_user:
+                raise HTTPException(status_code=401, detail="缺少已验证用户身份")
+        roles = frozenset(
+            item.strip() for item in authenticated_roles.split(",") if item.strip()
+        )
+        return _AuthContext(authenticated_user, roles)
+
+    def case_access_user(
+        case_id: str, declared_user_id: str, auth: _AuthContext
+    ) -> str:
+        if require_authenticated_user and "cardiology-reviewer" in auth.roles:
+            try:
+                metadata = case_store.get_case_by_id(case_id)
+            except CaseStoreError as exc:
+                _raise_http(exc)
+            if metadata["sysUserId"] != declared_user_id:
+                raise HTTPException(status_code=404, detail="病例不存在")
+            return metadata["sysUserId"]
+        return _effective_user(
+            declared_user_id, auth.user_id, require_authenticated_user
+        )
+
+    @app.on_event("startup")
+    def recover_reserved_case_submissions() -> None:
+        """补建“病例已落盘、任务尚未创建”窗口里的任务。"""
+        store: TaskStore = app.state.store
+        for metadata, diagnosis in case_store.reserved_diagnoses():
+            assets_by_id = {item["assetId"]: item for item in metadata["assets"]}
+            try:
+                assets = [assets_by_id[item] for item in diagnosis["assetIds"]]
+            except KeyError:
+                continue
+            images = _images_from_assets(assets)
+            scoped_request_id = "case-" + hashlib.sha256(
+                f"{metadata['caseId']}\0{diagnosis['requestId']}".encode("utf-8")
+            ).hexdigest()
+            _, _, created = store.create_or_get(
+                diagnosis["taskId"],
+                images,
+                request_id=scoped_request_id,
+                sys_user_id=metadata["sysUserId"],
+            )
+            case_store.mark_diagnosis_submitted(
+                metadata["caseId"], metadata["sysUserId"], diagnosis["taskId"]
+            )
+            if created:
+                if app.state.sync:
+                    _execute(app, diagnosis["taskId"], images)
+                else:
+                    app.state.task_queue.enqueue(
+                        _execute, app, diagnosis["taskId"], images
+                    )
 
     @app.get("/heart-algo/portal", include_in_schema=False)
     def case_portal():
@@ -238,9 +357,17 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         )
 
     @app.post("/heart-algo/cases", status_code=status.HTTP_201_CREATED)
-    def create_case(req: CreateCaseRequest):
+    def create_case(
+        req: CreateCaseRequest,
+        auth: _AuthContext = Depends(authenticated_context),
+    ):
+        user_id = _effective_user(
+            req.sysUserId, auth.user_id, require_authenticated_user
+        )
         try:
-            metadata, created = case_store.create_case(req.sysUserId, req.requestId)
+            metadata, created = case_store.create_case(
+                user_id, req.requestId, [service_user_id]
+            )
         except CaseStoreError as exc:
             _raise_http(exc)
         response = FileCaseStore.public_case(metadata)
@@ -248,9 +375,14 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         return response
 
     @app.get("/heart-algo/cases/{case_id}")
-    def get_case(case_id: str, sys_user_id: str = Query(...)):
+    def get_case(
+        case_id: str,
+        sys_user_id: str = Query(...),
+        auth: _AuthContext = Depends(authenticated_context),
+    ):
+        user_id = case_access_user(case_id, sys_user_id, auth)
         try:
-            return FileCaseStore.public_case(case_store.get_case(case_id, sys_user_id))
+            return FileCaseStore.public_case(case_store.get_case(case_id, user_id))
         except CaseStoreError as exc:
             _raise_http(exc)
 
@@ -265,11 +397,15 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         assetId: str | None = Form(None),
         dcmType: str | None = Form(None),
         file: UploadFile = File(...),
+        auth: _AuthContext = Depends(authenticated_context),
     ):
+        user_id = _effective_user(
+            sysUserId, auth.user_id, require_authenticated_user
+        )
         try:
             asset, created = case_store.add_asset(
                 case_id,
-                sysUserId,
+                user_id,
                 assetId or f"asset-{uuid4().hex}",
                 modality,
                 dcmType,
@@ -288,13 +424,20 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         "/heart-algo/cases/{case_id}/diagnoses",
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def submit_diagnosis(case_id: str, req: SubmitDiagnosisRequest):
+    def submit_diagnosis(
+        case_id: str,
+        req: SubmitDiagnosisRequest,
+        auth: _AuthContext = Depends(authenticated_context),
+    ):
+        user_id = _effective_user(
+            req.sysUserId, auth.user_id, require_authenticated_user
+        )
         return submit_case_diagnosis(
             app,
             case_store,
             case_id,
             req.requestId,
-            req.sysUserId,
+            user_id,
             req.assetIds,
         )
 
@@ -303,9 +446,11 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         case_id: str,
         task_id: str,
         sys_user_id: str = Query(...),
+        auth: _AuthContext = Depends(authenticated_context),
     ):
+        user_id = case_access_user(case_id, sys_user_id, auth)
         return get_case_diagnosis_result(
-            app, case_store, case_id, task_id, sys_user_id
+            app, case_store, case_id, task_id, user_id
         )
 
     @app.post(
@@ -316,9 +461,28 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         case_id: str,
         task_id: str,
         req: ReviewDiagnosisRequest,
+        auth: _AuthContext = Depends(authenticated_context),
     ):
+        if require_authenticated_user:
+            reviewer_id = _effective_user(
+                req.reviewerId, auth.user_id, require_authenticated_user
+            )
+            if "cardiology-reviewer" not in auth.roles:
+                raise HTTPException(status_code=403, detail="缺少临床复核角色")
+            try:
+                metadata = case_store.get_case_by_id(case_id)
+            except CaseStoreError as exc:
+                _raise_http(exc)
+            user_id = metadata["sysUserId"]
+            if req.sysUserId != user_id:
+                raise HTTPException(status_code=404, detail="病例不存在")
+            if reviewer_id == user_id:
+                raise HTTPException(status_code=403, detail="病例所有者不能自我复核")
+        else:
+            user_id = req.sysUserId
+            reviewer_id = req.reviewerId
         store: TaskStore = app.state.store
-        task = store.get_for_user(task_id, req.sysUserId)
+        task = store.get_for_user(task_id, user_id)
         if task is None:
             raise HTTPException(status_code=404, detail="诊断任务不存在")
         if task["taskState"] != 2:
@@ -326,9 +490,9 @@ def install_case_routes(app: FastAPI, case_store: FileCaseStore) -> None:
         try:
             return case_store.record_review(
                 case_id,
-                req.sysUserId,
+                user_id,
                 task_id,
-                req.reviewerId,
+                reviewer_id,
                 req.decision,
                 req.comment,
             )

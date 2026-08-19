@@ -16,12 +16,10 @@ from threading import RLock
 from typing import BinaryIO
 from uuid import uuid4
 
+from metric_catalog import VIEW_METRICS
 
-SUPPORTED_DCM_TYPES = frozenset({
-    "PLAX", "A4C", "Subcostal", "RVOT", "MV_EA", "AV_Vmax",
-    "TR_Vmax", "MR_Vmax", "LVOT_Vmax", "TDI_Medial",
-    "TDI_Lateral", "TAPSE",
-})
+
+SUPPORTED_DCM_TYPES = frozenset(VIEW_METRICS)
 SUPPORTED_MODALITIES = frozenset({"CARDIAC_ULTRASOUND", "ECG"})
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -58,6 +56,7 @@ class FileCaseStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.max_asset_bytes = max_asset_bytes
         self._lock = RLock()
+        self._instance_lock_handle: BinaryIO | None = None
 
     @classmethod
     def from_environment(cls, root: str | Path) -> "FileCaseStore":
@@ -68,9 +67,62 @@ class FileCaseStore:
             ),
         )
 
-    def create_case(self, sys_user_id: str, request_id: str) -> tuple[dict, bool]:
+    def acquire_instance_lock(self) -> None:
+        """阻止两个生产进程同时修改同一病例目录。"""
+        if self._instance_lock_handle is not None:
+            return
+        lock_path = self.root / ".instance.lock"
+        handle = lock_path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise CaseConflictError(
+                "CASE_STORAGE_ROOT 已被另一个算法服务实例占用"
+            ) from exc
+        self._instance_lock_handle = handle
+
+    def close_instance_lock(self) -> None:
+        handle = self._instance_lock_handle
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            self._instance_lock_handle = None
+
+    def create_case(
+        self,
+        sys_user_id: str,
+        request_id: str,
+        authorized_service_ids: list[str] | None = None,
+    ) -> tuple[dict, bool]:
         _validate_id(sys_user_id, "sysUserId")
         _validate_id(request_id, "requestId")
+        services = list(dict.fromkeys(authorized_service_ids or []))
+        for service_id in services:
+            _validate_id(service_id, "authorizedServiceId")
         with self._lock:
             for metadata_path in self.root.glob("case-*/case.json"):
                 metadata = self._read_json(metadata_path)
@@ -78,6 +130,13 @@ class FileCaseStore:
                     metadata.get("sysUserId") == sys_user_id
                     and metadata.get("createRequestId") == request_id
                 ):
+                    existing_services = metadata.setdefault("authorizedServiceIds", [])
+                    missing_services = [
+                        item for item in services if item not in existing_services
+                    ]
+                    if missing_services:
+                        existing_services.extend(missing_services)
+                        self._write_case(metadata)
                     return metadata, False
 
             case_id = f"case-{uuid4().hex}"
@@ -90,6 +149,7 @@ class FileCaseStore:
                 "diagnoses": [],
                 "review": None,
                 "reviewHistory": [],
+                "authorizedServiceIds": services,
             }
             self._write_case(metadata)
             return metadata, True
@@ -103,6 +163,28 @@ class FileCaseStore:
                 raise CaseNotFoundError("病例不存在")
             metadata = self._read_json(path)
             if metadata.get("sysUserId") != sys_user_id:
+                raise CaseNotFoundError("病例不存在")
+            return metadata
+
+    def get_case_by_id(self, case_id: str) -> dict:
+        """内部授权完成后读取病例；不得直接暴露为外部端点。"""
+        _validate_id(case_id, "caseId")
+        with self._lock:
+            path = self._case_path(case_id)
+            if not path.is_file():
+                raise CaseNotFoundError("病例不存在")
+            return self._read_json(path)
+
+    def get_case_for_service(self, case_id: str, service_user_id: str) -> dict:
+        """按病例级 ACL 授权 MCP 服务账号访问，不改变病例所有者。"""
+        _validate_id(case_id, "caseId")
+        _validate_id(service_user_id, "serviceUserId")
+        with self._lock:
+            path = self._case_path(case_id)
+            if not path.is_file():
+                raise CaseNotFoundError("病例不存在")
+            metadata = self._read_json(path)
+            if service_user_id not in metadata.get("authorizedServiceIds", []):
                 raise CaseNotFoundError("病例不存在")
             return metadata
 
@@ -181,28 +263,75 @@ class FileCaseStore:
         finally:
             partial.unlink(missing_ok=True)
 
-    def record_diagnosis(
+    def reserve_diagnosis(
         self,
         case_id: str,
         sys_user_id: str,
         task_id: str,
         request_id: str,
         asset_ids: list[str],
-    ) -> None:
+    ) -> tuple[dict, bool]:
+        """先持久化提交意图；相同请求只有输入完全相同时才视为幂等。"""
         with self._lock:
             metadata = self.get_case(case_id, sys_user_id)
             existing = next(
+                (
+                    item
+                    for item in metadata["diagnoses"]
+                    if item.get("requestId") == request_id
+                ),
+                None,
+            )
+            if existing is not None:
+                if existing.get("assetIds") != list(asset_ids):
+                    raise CaseConflictError("requestId 已用于不同的诊断输入")
+                return existing, False
+            diagnosis = {
+                "taskId": task_id,
+                "requestId": request_id,
+                "assetIds": list(asset_ids),
+                "submissionState": "reserved",
+                "createdAt": _utc_now(),
+            }
+            metadata["diagnoses"].append(diagnosis)
+            self._write_case(metadata)
+            return diagnosis, True
+
+    def mark_diagnosis_submitted(
+        self, case_id: str, sys_user_id: str, task_id: str
+    ) -> None:
+        with self._lock:
+            metadata = self.get_case(case_id, sys_user_id)
+            diagnosis = next(
                 (item for item in metadata["diagnoses"] if item["taskId"] == task_id),
                 None,
             )
-            if existing is None:
-                metadata["diagnoses"].append({
-                    "taskId": task_id,
-                    "requestId": request_id,
-                    "assetIds": list(asset_ids),
-                    "createdAt": _utc_now(),
-                })
-                self._write_case(metadata)
+            if diagnosis is None:
+                raise CaseNotFoundError("诊断任务不存在")
+            diagnosis["submissionState"] = "submitted"
+            self._write_case(metadata)
+
+    def reserved_diagnoses(self) -> list[tuple[dict, dict]]:
+        """返回需要在启动时补建任务的提交意图。"""
+        with self._lock:
+            pending: list[tuple[dict, dict]] = []
+            for metadata_path in self.root.glob("case-*/case.json"):
+                metadata = self._read_json(metadata_path)
+                for diagnosis in metadata.get("diagnoses", []):
+                    if diagnosis.get("submissionState") == "reserved":
+                        pending.append((metadata, diagnosis))
+            return pending
+
+    def find_case_for_task(self, task_id: str, sys_user_id: str) -> str:
+        """为只持有 taskId 的 MCP 资源定位服务账号下的病例。"""
+        with self._lock:
+            for metadata_path in self.root.glob("case-*/case.json"):
+                metadata = self._read_json(metadata_path)
+                if sys_user_id not in metadata.get("authorizedServiceIds", []):
+                    continue
+                if any(item.get("taskId") == task_id for item in metadata.get("diagnoses", [])):
+                    return metadata["caseId"]
+        raise CaseNotFoundError("诊断任务不存在")
 
     def diagnosis_belongs_to_case(
         self, case_id: str, sys_user_id: str, task_id: str
