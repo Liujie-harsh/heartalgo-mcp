@@ -15,9 +15,9 @@
 | 超声测量模型 | **EchoNet-Measurements**（deeplabv3_resnet50 骨干，2D 线性测量 + Doppler 峰值流速） |
 | 心电图模型 | **ECG-FM**（fairseq-signals 框架，wav2vec2 风格 ECG transformer，17 分类微调模型） |
 | 前端指标 | LVEF、LVEDD、LVESD、LAD、E/A、GLS 等（详见旧 handoff.md；LVEF 需 Teichholz 公式从 LVID 估算，模型不直接输出） |
-| 当前阶段 | **非 Agent 可靠闭环主路径已通过；P0/P1 工程实现已部署并开始服务器门禁**。服务器单测 `189 passed, 7 skipped`，18 个模型 artifact 已生成可追溯发布版本；资产审计为 9/12，余下 3 个切面因缺真实 DICOM 临时豁免 |
+| 当前阶段 | **非 Agent 可靠闭环主路径已通过；PLAX 修复已部署，新的文件传输发布清单已生成，但运行中的服务仍加载旧算法版本**。原始 BOM ECG 功能冒烟通过；正常 PLAX 六模型最终完成但约耗时 45 分钟，AorticRoot 为当前性能瓶颈；资产审计仍为 9/12 条件通过 |
 | 当前运行模式 | 代码通过文件传输部署到 `D:\project\heart`；真实算法、MySQL 任务存储、单 worker、仅监听 `127.0.0.1`、联调阶段暂时 `--no-mcp` |
-| 尚未完成 | 部署并复测 PLAX 修复、新版本任务与原始 BOM XML 冒烟、PhysicalDelta 临床校准、9 切面条件 CPU 稳定性门禁、3 个豁免切面样本补齐、生产鉴权/网关、MCP 与 Agent Harness 联调 |
+| 尚未完成 | 从新清单正确注入版本并重启服务、验证新任务记录新版本、失败样本 `00005...dcm` 回归、PLAX 性能治理、DTD/实体及伪 XML 拒绝、PhysicalDelta 临床校准、9 切面条件 CPU 稳定性门禁、3 个豁免切面样本补齐、生产鉴权/网关、MCP 与 Agent Harness 运行时联调 |
 
 ---
 
@@ -66,7 +66,7 @@ hydra-core / omegaconf / wfdb / scikit-learn / matplotlib / tqdm：已装
 | ecg 权重（17 分类微调） | `D:\project\ecg-fm\ecg-fm\weights\mimic_iv_ecg_finetuned.pt`（1.08 GB，另有 physionet 预训练版） |
 | 标签定义（脚本依赖） | `D:\project\ecg-fm\ecg-fm\ecg-fm\data\mimic_iv_ecg\labels\label_def.csv` |
 | 测试数据 | `D:\heart-data\cases\test`（`dcm\{plax,a4c,MV_EA,TR_Vmax,MR_Vmax,LVOT_Vmax,TDI_Medial,TDI_Lateral,TAPSE}\*.dcm` + `ecg\2.xml`） |
-| 当前可上传 ECG smoke 文件 | `D:\heart-data\cases\test\ecg\2-no-bom.xml` |
+| 当前可上传 ECG smoke 文件 | `D:\heart-data\cases\test\ecg\2.xml`（原始 UTF-8 BOM，服务器功能冒烟已通过）；`2-no-bom.xml` 保留为历史对照 |
 | 任务工作目录 | `D:\heart-data\runtime` |
 | 病例文件存储 | `D:\heart-data\cases` |
 | P0/P1 验证报告 | `D:\heart-data\validation`（含模型覆盖报告与 `release-manifest.json`） |
@@ -120,8 +120,10 @@ hydra-core / omegaconf / wfdb / scikit-learn / matplotlib / tqdm：已装
 - `925a7d6 feat: add reliable heart diagnosis case workflow`
 - `3c1464f fix: harden reliable diagnosis workflow`
 - `8f81cc4 feat: add P0 P1 reliability validation gates`
+- `f738d3c fix: harden PLAX CPU inference diagnostics`
+- `a170004 fix: address PLAX acceptance review`
 
-服务器已部署版本的测试基线为 `189 passed, 7 skipped`；本地 PLAX 修复候选为 `193 passed, 7 skipped`，部署后需在服务器复现该基线。详细端点、幂等、鉴权、锁和恢复边界见 `docs\phase1-reliable-loop.md`；P0/P1 发布与验证命令见 `docs\p0-p1-validation.md`。
+PLAX 修复本地完整基线为 `193 passed, 7 skipped`；服务器验收清单已将完整部署、修复标识和回归测试标记完成，原始摘要应保留在 `D:\heart-data\validation\pytest-summary.txt`。详细端点、幂等、鉴权、锁和恢复边界见 `docs\phase1-reliable-loop.md`；P0/P1 发布与验证命令见 `docs\p0-p1-validation.md`。
 
 ### 4.5 P0/P1 可靠性门禁（工程实现已完成并部署）
 
@@ -129,18 +131,27 @@ hydra-core / omegaconf / wfdb / scikit-learn / matplotlib / tqdm：已装
 - 真实模式启动时冻结 `ALGORITHM_VERSION`，任务结果记录固定版本。
 - 新增模型 artifact SHA-256 发布清单、模型覆盖审计、PhysicalDelta 临床标定和串行 CPU 稳定性工具。
 - Measurement 子任务增加显式超时；CPU 基准采集进程树峰值 RSS，并校验单图模型结果。
-- 服务器代码不是通过 Git 部署，而是文件传输；已对当前 30 个运行源文件生成代码指纹 `bundle-2066fea65c13`。
-- 18 个模型 artifact 已完成内容哈希，当前发布标识为 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`。
+- 服务器代码不是通过 Git 部署，而是文件传输；历史代码指纹为 `bundle-2066fea65c13`，本次部署后对 30 个运行/发布文件重新计算得到 `bundle-f06f5f050c98`。
+- 18 个模型 artifact 已重新读取并完成内容哈希；新清单候选版本为 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`。旧版本 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb` 只应保留给历史任务。
 - 发布清单位于 `D:\heart-data\validation\release-manifest.json`；每次新开 PowerShell 或启动服务都需从该文件重新注入 `ALGORITHM_VERSION`。
+- 当前存在关键证据冲突：生成清单的 PowerShell 已显示新版本，但实际服务启动日志仍打印旧版本，说明环境变量没有进入启动服务的那个进程。新版本身份门禁尚未通过。
 
-### 4.6 2026-08-20 PLAX 慢任务与错误诊断（本地修复待部署）
+### 4.6 2026-08-20 PLAX 慢任务与错误诊断（修复已部署，性能待治理）
 
 - 最新附件中的 `return_code=3221225786 (0xC000013A)` 和 `KeyboardInterrupt` 是服务被 Ctrl+C 停止后中断仍在逐帧推理的 PyTorch 子进程，不是模型自行崩溃。
 - 纯 CPU PLAX 会顺序运行 LVID、IVS、LVPW、LA、Aorta、AorticRoot 六个模型；历史整例约 379 秒，页面长期显示 `processing` 属于当前容量边界，验收时不得中途停止服务。
 - 另一个 `systolic_i[0]` 的 `IndexError` 已用真实失败样本距离曲线复现：固定 `distance=25` 后首尾极值清理会使收缩峰数组为空。
-- 算法服务本地修复：LVID 不再传入服务未消费的 `--phase_estimate`；Windows Ctrl+C 返回码映射为明确的“服务停止导致中断”；每个 Measurement 子任务记录 `duration_seconds`；门户显示已等待秒数和 PLAX CPU 提示。
-- 服务器部署本次修复后必须重新生成发布身份，旧 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb` 只能保留为历史任务版本。
+- 算法服务修复已部署：LVID 不再传入服务未消费的 `--phase_estimate`；Windows Ctrl+C 返回码映射为明确的“服务停止导致中断”；每个 Measurement 子任务记录 `duration_seconds`；门户显示已等待秒数和 PLAX CPU 提示。
+- 正常 PLAX 样本的 LVID、IVS、LVPW、LA、Aorta 均正常完成；AorticRoot 阶段长时间无进展，任务最终约 45 分钟完成。该结果约为历史 379 秒基线的 7 倍，不能作为正常容量基线。
+- 性能观察时误采集了 Uvicorn 主服务进程而非 `inference_2D_image.py --model_weights aortic_root` 子进程，因此已有 `CPU/RSS` 数值不能用于判断 AorticRoot 是否满负载或卡死；后续必须采集实际子进程 PID、逐模型耗时和进程树峰值 RSS。
 - 下午逐项验收使用 `docs\server-validation-checklist.md`，未取得服务器、临床或真实样本证据的项目不得标记通过。
+
+### 4.7 DeepSeek Harness 插件进度
+
+- `deepseek-harness-plugin` 已形成可独立安装的 `dsh.bundle.patch`，通过 `@deepseek-ai/dsh-mcp-client` 将 `/mcp` Streamable HTTP 端点注册为原生工具；插件不复制算法逻辑，也不直接接收服务器文件路径。
+- 已实现环境变量注入的 MCP URL/Bearer Token、60 秒短调用超时、异步提交/查询契约、最小权限 `caseId/assetId` 边界、安装/卸载及排错文档。相关提交为 `6171890`、`65fd38a`、`c3ad655`。
+- 本地验证：`npm run check` 通过；`python -m pytest -q test/test_deepseek_harness_plugin.py` 为 `4 passed`；使用临时 npm cache 的 `npm pack --dry-run` 成功，包内仅 4 个声明文件，无凭据写入。
+- 当前运行时尚未联调：本机 Node.js 为 `20.11.1`，低于插件声明的 `>=20.12.0`；尚未在真实 DeepSeek Harness profile 执行 `dsh plugin add` / `dsh --dump-config`；算法服务仍以 `--no-mcp` 启动。生产安全和临床门禁通过前不得提前启用真实 MCP。
 
 ---
 
@@ -162,8 +173,9 @@ Processed 1 MAT file(s), 1 five-second segment(s).
 
 - 已通过：`TR_Vmax=64.12 cm/s`、`TAPSE=18.7`、`TDI_Medial=77.99`、`TDI_Lateral=8.48`、`MR_Vmax=81.13`、`LVOT_Vmax=25.2`。
 - `MV_EA` 未通过：测试图像 `y0=227`，而当前模型只支持约 `340–350` 的输入区域；wrapper 正确返回“心超图像超出模型支持范围”。这属于样本/模型支持域问题，不是服务编排故障。
-- `PLAX` 历史运行部分通过：曾产出 `LVEF=27.42`、`LVEDD=66.54`、`LVESD=57.81`，当时随后因缺少 `ivs_weights.ckpt` 失败，CPU 单次约 379 秒。相关权重现已补齐，但仍需重新执行完整 PLAX 推理和临床校准。
-- 2026-08-20 最新 PLAX 门户任务在逐帧 LVID 推理期间被人工停止，故只证明纯 CPU 任务耗时较长，不能记为模型失败或完整 PLAX 验收；本地可靠性修复仍待部署复测。
+- `PLAX` 历史运行部分通过：曾产出 `LVEF=27.42`、`LVEDD=66.54`、`LVESD=57.81`，当时随后因缺少 `ivs_weights.ckpt` 失败，CPU 单次约 379 秒。相关权重现已补齐。
+- 2026-08-20 第一次 PLAX 门户任务在逐帧 LVID 推理期间被人工停止，附件中的 `0xC000013A/KeyboardInterrupt` 因此不能记为模型自行失败。
+- 修复部署后的正常 PLAX 样本已依次完成 LVID、IVS、LVPW、LA、Aorta、AorticRoot，最终总耗时约 45 分钟；AorticRoot 是现场观察到的长尾阶段。功能路径完成，但性能门禁未通过，且仍需保存六个精确 `duration_seconds` 和临床校准证据。
 - `AV_Vmax` 权重存在，但仍缺合适测试 DICOM。
 
 ### 5.4 真实算法服务闭环（✅ 已通）
@@ -177,23 +189,34 @@ Processed 1 MAT file(s), 1 five-second segment(s).
 | TR_Vmax + ECG 混合任务 | ✅ completed | 同一报告同时包含一项心超和一项 ECG；两项输入均有 SHA-256 与大小追溯信息 |
 | 临床复核 | ✅ approved | 批准后 `reviewStatus=approved`、`requiresClinicianReview=false` |
 | 服务重启后查询 | ✅ completed | 以原病例用户查询旧 `caseId/taskId`，仍返回完整混合结果和批准记录 |
+| 历史任务版本不可变 | ✅ 保持不变 | 重启前后同一已完成且批准的旧任务均为 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb` |
+| 原始 BOM ECG 功能冒烟 | ✅ completed | 原始 `2.xml` 上传和真实推理完成；但运行服务仍标记旧算法版本，不能据此勾选“新版本任务”门禁 |
 
 原始任务 ID、资产 ID、哈希和患者字段保留在服务器验证记录中；本文按交接最小化原则不复制。ECG-only 的 `hfType=null`，心超/混合任务的 `hfType=未知`，说明编排成功，但心衰分型规则尚未得到临床验收。
 
 ### 5.5 P0/P1 服务器门禁进度（🟡 条件通过，仍有阻塞项）
 
-- 依赖安装完成，服务器回归测试为 `189 passed, 7 skipped`；`psutil 7.0.0` 与 `pydicom 2.4.4` 已安装。
+- 依赖安装完成；服务器验收清单已将本次完整部署、修复标识和回归测试标记完成；`psutil 7.0.0` 与 `pydicom 2.4.4` 已安装。
 - ECG-FM 使用真实 MAT 和微调权重在 CPU 上成功处理 1 个文件/1 个五秒片段，并产出分段及聚合预测 CSV。
 - Measurement 所有脚本存在；9 个 2D 权重和 8 个 Doppler/TAPSE 权重均存在，无 Git LFS 指针、无结构无效权重。
 - 模型资产审计当前为 `assetReadyViews=9/12`、`allAssetsReady=false`、`missingWeights=[]`。唯一缺口是 `Subcostal`、`RVOT`、`AV_Vmax` 没有有效测试 DICOM。
 - 本轮决定对上述 3 个切面做临时联调豁免；只能形成“9/12 条件验收”，不得描述为全切面生产通过。当前严格门禁仍会返回非零，后续需部署显式 waiver 能力或补齐真实样本。
-- 文件传输部署的源代码指纹生成成功：`serviceVersion=bundle-2066fea65c13`。
-- 18 个模型 artifact 参数校验为 `artifactCount=18`、`artifactArgCount=36`，发布清单生成成功；当前 `ALGORITHM_VERSION=heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`。
-- 尚未验证：使用该环境变量启动真实服务并创建新任务、原始 BOM XML 端到端上传、经医生确认的 PhysicalDelta 报告、9 切面 CPU 连续任务报告。
+- 新文件传输部署的源代码指纹生成成功：`serviceVersion=bundle-f06f5f050c98`；30 个运行/发布文件清单应保存在 `D:\heart-data\validation\service-bundle-manifest.json`。
+- 18 个模型 artifact 参数校验和内容哈希完成，新发布清单生成 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`。
+- 实际服务启动日志仍显示旧版本 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`。根因是 PowerShell 环境变量只在当前进程生效；生成清单和启动服务不在同一个已正确重载环境变量的进程中。必须重启并以启动日志为最终证据。
+- 原始 BOM ECG 功能冒烟已完成；DTD/实体和非 XML 的 422 拒绝尚未现场执行。经医生确认的 PhysicalDelta 报告、9 切面 CPU 连续任务报告仍未完成。
 
-### 5.6 当前阶段结论
+### 5.6 PLAX 正常样本性能实测
 
-第一阶段已完成“上传—排队—真实 CPU 推理—结构化报告—医生复核—重启后读取”的非 Agent 闭环；P0/P1 的代码与发布身份也已落到服务器。下一步先完成新版本服务/BOM 冒烟、PhysicalDelta 临床标定和 9 切面条件 CPU 基准，再处理生产边界并开启 MCP/Agent 接入。
+- 正常 PLAX 单图最终完成六模型推理，总耗时约 45 分钟；现场曾在 `processing` 状态观察到已等待 1399 秒。
+- 运行顺序为 LVID → IVS → LVPW → LA → Aorta → AorticRoot；前五项正常完成，最后的 AorticRoot 出现明显长尾。
+- 当时活动推理子进程命令明确包含 `--model_weights aortic_root`；但性能采样使用的是 Uvicorn 主进程 PID，所得约 65 MB RSS 和累计 CPU 不能代表模型子进程。
+- 当前结论：PLAX 功能回归可记为“正常样本 completed”，性能只能记为 `FAIL/待治理`；不能把 45 分钟当作正常纯 CPU 基线。失败样本 `00005_851deaabbf3089ae.dcm` 尚未回归。
+- 下一轮需直接采集活动 `inference_2D_image.py` 子进程，保存六个逐模型耗时、任务总耗时、进程树峰值 RSS、DICOM 帧数/分辨率，并对 AorticRoot 做单模型 CPU 基准；随后再决定 GPU 迁移。GPU 迁移不能替代当前长尾定位。
+
+### 5.7 当前阶段结论
+
+第一阶段已完成“上传—排队—真实 CPU 推理—结构化报告—医生复核—重启后读取”的非 Agent 闭环；PLAX 修复代码和新发布清单已落到服务器，但运行进程仍使用旧版本标签。下一步必须先用新清单重启并验证新任务版本，再回归 `00005...dcm`、定位 AorticRoot 长尾和完成 PhysicalDelta/9 切面 CPU 门禁。DeepSeek Harness 插件工程包已自检通过，但只有生产安全、临床门禁和 MCP 运行时配置满足后才能进入真实联调。
 
 ---
 
@@ -244,6 +267,10 @@ $env:ALLOW_INSECURE_CASE_API = "true"
 $env:PYTHON_QUEUE_WORKERS = "1"
 $env:PYTHON_GPU_IDS = "0"
 $env:ALGORITHM_VERSION = (Get-Content -Raw "D:\heart-data\validation\release-manifest.json" | ConvertFrom-Json).algorithmVersion
+
+if ($env:ALGORITHM_VERSION -ne "heart@bundle-f06f5f050c98+models@4bf76612484dd393") {
+    throw "启动版本与本次发布清单不一致：$env:ALGORITHM_VERSION"
+}
 
 & "C:\Users\lj\miniconda3\envs\heart\python.exe" ".\main.py" `
   --measurement-script-dir "D:\project\Measurement\Measurement" `
@@ -298,13 +325,14 @@ $env:ALGORITHM_VERSION = (Get-Content -Raw "D:\heart-data\validation\release-man
 3. **LA 切面待定**：临床 LA 前后径标准在 PLAX；测试数据 `dcm\a4c` 曾用于 la 也能跑通。建议两个切面各跑一例，按换算后数值合理性（LA 2.7–3.8 cm）定夺。
 4. **三个切面缺样本**：全部 2D/Doppler 权重已补齐，但 `Subcostal`、`RVOT`、`AV_Vmax` 缺真实去标识化 DICOM。本轮仅临时豁免，不能形成 12/12 全切面验收。
 5. **LVEF**：模型不输出，需 Teichholz 公式：EDV=7D³/(2.4+D)，LVEF=(EDV−ESV)/EDV×100（D 取 LVEDD/LVESD）。
-6. **服务器纯 CPU**：没有可用 GPU，PLAX 依次运行 6 个二维模型，耗时数分钟是当前实现的已知容量边界；历史整例约 379 秒。保持 `PYTHON_QUEUE_WORKERS=1`，不要因页面持续 `processing` 而停止服务。部署本次修复后用逐模型 `duration_seconds` 和进程树 RSS 建立新基线。
-7. **ECG XML BOM 服务冒烟待补**：代码和自动化测试已支持 UTF-8 BOM，并拒绝 DTD/实体及伪 XML；服务器此前通过无 BOM 副本联调，仍需用原始 BOM 文件对新版本做端到端上传验证。
-8. **算法版本已发布、任务验证待补**：发布清单和环境变量已生成；仍需重启真实服务、创建新任务并确认报告版本为 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`，同时确认旧任务版本不被改写。
+6. **服务器纯 CPU / AorticRoot 长尾**：PLAX 依次运行 6 个二维模型，正常样本本轮约 45 分钟才完成，明显慢于历史约 379 秒；AorticRoot 是当前观察到的长尾阶段。`900` 秒是每个子模型而非整任务超时，六模型串行会让 `processing` 持续很久。已有 CPU/RSS 采样误用了主服务 PID，必须重测实际推理子进程后再判断 GPU 迁移。
+7. **ECG XML 安全负例待补**：原始 UTF-8 BOM `2.xml` 已完成服务器功能冒烟；DTD/实体 XML 和非 XML 内容的 422 拒绝仍未现场执行。当前运行服务仍使用旧算法版本标签，因此还需在新版本进程上重跑一次快速 ECG 以完成发布门禁。
+8. **新清单已生成但服务仍加载旧版本**：新候选为 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`，实际启动日志仍为历史版本 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`。必须在启动服务的同一个 PowerShell 中重新读取清单；以启动日志为准，不能以另一个窗口的 `$env:ALGORITHM_VERSION` 为准。
 9. **当前鉴权仅供 smoke test**：`CASE_AUTH_REQUIRED=false` 和 `ALLOW_INSECURE_CASE_API=true` 不能用于生产，也不能把端口直接暴露到外网。生产需受信网关剥离/重写身份头、注入代理密钥，并恢复临床复核角色约束。
 10. **PowerShell 中文显示**：`Invoke-RestMethod` 的控制台表格曾把“未知”显示为乱码，但浏览器 JSON 正常。这更像控制台编码/格式化问题；需要区分显示乱码与服务端 JSON 编码错误。
 11. **患者数据与日志**：结构化 ECG 结果含年龄、性别和患者标识。后续日志、截图、Agent 上下文和问题单必须默认脱敏；算法输入/输出不能直接发送给通用 LLM。
 12. **ecg 输入**：需 HL7 aECG XML（12 导联完整，长节律 ≥5000 点）经 `xml_to_ecgfm_mat.py` 转 MAT；`feats` 形状 (12, N)、`org_sample_rate` 字段。
+13. **DeepSeek Harness 尚未运行时验收**：插件包、自检、Python 契约测试和 dry-run 打包均已通过，但当前 Node.js `20.11.1` 低于声明的 `>=20.12.0`，未执行真实 profile 安装和 `dsh --dump-config`，算法服务也仍以 `--no-mcp` 启动。不得把“插件代码完成”写成“MCP/Agent 联调完成”。
 
 ---
 
@@ -320,9 +348,15 @@ $env:ALGORITHM_VERSION = (Get-Content -Raw "D:\heart-data\validation\release-man
 - [x] 定位 PLAX 最新“报错”为服务停止导致的子进程中断，并复现 LVID 空收缩峰数组缺陷。
 - [x] 在本地算法服务绕开未消费的 `--phase_estimate`、补充中断错误语义、逐模型耗时日志和门户等待提示。
 - [x] 生成覆盖全部 handoff 待办的服务器验收清单 `docs\server-validation-checklist.md`。
-- [ ] 将 PLAX 修复部署到服务器，重新生成代码/模型发布身份并完成两个 PLAX 样本回归。
-- [ ] 使用发布版本重启服务，新建任务并确认结果不再为 `unknown`、旧任务版本保持不变。
-- [ ] 使用原始 UTF-8 BOM ECG XML 做服务器端到端上传；同时验证 DTD/实体和伪 XML 仍被拒绝。
+- [x] 将 PLAX 修复完整部署到服务器，并生成新代码/模型发布身份 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`。
+- [x] 重启前后查询同一历史任务，确认旧任务版本和 approved 复核状态保持不变。
+- [x] 使用原始 UTF-8 BOM ECG XML 完成服务器功能冒烟。
+- [x] 完成正常 PLAX 样本六模型功能回归；最终约 45 分钟完成，性能门禁未通过。
+- [x] 完成 DeepSeek Harness 插件工程包、自检、契约单测和 dry-run 打包。
+- [ ] 在启动服务的同一 PowerShell 中注入新清单并重启，确认启动日志及新 ECG 任务均显示 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`。
+- [ ] 回归空收缩峰样本 `00005_851deaabbf3089ae.dcm`，确认 completed、六项结果且无 `IndexError`。
+- [ ] 对 AorticRoot 活动子进程做单模型/整任务性能采样，保存六项 `duration_seconds`、总耗时和进程树峰值 RSS，再决定 GPU 迁移方案。
+- [ ] 使用去标识化 DTD/实体和伪 XML 验证上传仍被 422 拒绝。
 - [ ] 核对 PhysicalDelta 标尺问题，修正并以人工测量金标准验证 cm/cm·s⁻¹ 换算（临床上线阻塞项）。
 - [ ] 获取 Subcostal、RVOT、AV_Vmax 测试 DICOM，取消临时豁免并完成 12/12 门禁。
 - [ ] 在样本补齐前完成明确标注 waiver 的 9 切面条件 CPU 基准；不得把结果记为全切面通过。
@@ -333,6 +367,7 @@ $env:ALGORITHM_VERSION = (Get-Content -Raw "D:\heart-data\validation\release-man
 - [ ] 把 MySQL、`D:\heart-data\cases` 和 `D:\heart-data\runtime` 纳入一致的备份、保留期、访问审计和恢复演练。
 - [ ] 完成生产服务托管（Windows Service/NSSM 或等价方案）、健康检查、日志轮转和启动失败告警。
 - [ ] 在以上生产边界满足后启用独立 MCP，再与 Agent Harness 做最小权限联调；Agent 只传 `caseId/assetId`，不直接访问算法服务器磁盘路径。
+- [ ] 将 Node.js 升级到 `>=20.12.0`，安装插件到实际 Harness profile，执行 `dsh --dump-config` 并完成三个 MCP 工具的异步提交/查询联调。
 - [ ] 心衰语料库/批量病例（`D:\project\心衰语料库`）接入批量推理。
 
 ---

@@ -23,8 +23,8 @@
 
 ## 1. 部署与代码回归
 
-- [ ] 将本次提交完整部署到 `D:\project\heart`，不要只复制单个文件。
-- [ ] 确认 `echonet_runner.py` 包含以下三个修复标识：
+- [x] 将本次提交完整部署到 `D:\project\heart`，不要只复制单个文件。
+- [x] 确认 `echonet_runner.py` 包含以下三个修复标识：
 
 ```powershell
 Set-Location D:\project\heart
@@ -34,7 +34,7 @@ Select-String -Path .\echonet_runner.py -Pattern `
   "相位覆盖层"
 ```
 
-- [ ] 回归测试通过且没有新增失败：
+- [x] 回归测试通过且没有新增失败：
 
 ```powershell
 conda activate heart
@@ -50,9 +50,9 @@ python -m pytest -q
 
 本次代码发生变化，旧版本 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb` 只能作为历史任务版本，不能继续标记新任务。
 
-- [ ] 按 `docs\p0-p1-validation.md` 第 3 节重新生成 `release-manifest.json`。
-- [ ] 服务版本必须对应本次提交或本次部署包的不可变指纹。
-- [ ] 18 个模型 artifact 必须重新读取并保持完整哈希。
+- [x] 按 `docs\p0-p1-validation.md` 第 3 节重新生成 `release-manifest.json`。
+- [x] 服务版本必须对应本次提交或本次部署包的不可变指纹。
+- [x] 18 个模型 artifact 必须重新读取并保持完整哈希。
 - [ ] 启动前从新清单注入环境变量：
 
 ```powershell
@@ -89,14 +89,16 @@ $oldAfter | Select-Object caseId,taskId,status,algorithmVersion
 ```
 
 - [ ] 原始 BOM ECG 新任务完成后，`algorithmVersion` 等于新清单。
-- [ ] 旧任务重启前后 `algorithmVersion` 完全一致。
+- [x] 旧任务重启前后 `algorithmVersion` 完全一致。
 - [ ] 旧任务报告、临床复核记录和输入哈希未被重写。
 
 证据：只保存去标识化的任务 ID、状态、版本和哈希比较，不复制患者字段。
 
+现场记录：新清单已生成 `heart@bundle-f06f5f050c98+models@4bf76612484dd393`，但实际服务启动日志仍显示旧版本 `heart@bundle-2066fea65c13+models@feb35a11fa0e0bcb`。必须在启动服务的同一 PowerShell 中重新加载清单并重启后再勾选新版本门禁。
+
 ## 4. ECG XML 安全冒烟
 
-- [ ] 原始 UTF-8 BOM 文件 `D:\heart-data\cases\test\ecg\2.xml` 上传 201，真实推理 completed。
+- [x] 原始 UTF-8 BOM 文件 `D:\heart-data\cases\test\ecg\2.xml` 上传 201，真实推理 completed。
 - [ ] DTD/实体 XML 上传被 422 拒绝。
 - [ ] 非 XML 内容上传被 422 拒绝。
 - [ ] 报告版本等于新发布清单，ECG `error=null` 且 predictions 非空。
@@ -110,11 +112,13 @@ $oldAfter | Select-Object caseId,taskId,status,algorithmVersion
 ### 5.1 已知可运行样本
 
 - 输入：`D:\heart-data\cases\test\dcm\plax\00003_2dbbf05f7a19120f.dcm`
-- [ ] 门户任务最终为 completed；等待期间不停止服务。
-- [ ] 日志按顺序出现 6 条 `心超子任务完成 metric=... duration_seconds=...`。
-- [ ] 日志不出现 `KeyboardInterrupt`、`IndexError` 或 `--phase_estimate`。
-- [ ] 报告包含 LVID、IVS、LVPW、LA、Aorta、AorticRoot；单图 `error=null`。
+- [x] 门户任务最终为 completed；等待期间不停止服务。
+- [x] 日志按顺序出现 6 条 `心超子任务完成 metric=... duration_seconds=...`。
+- [x] 日志不出现 `KeyboardInterrupt`、`IndexError` 或 `--phase_estimate`。
+- [x] 报告包含 LVID、IVS、LVPW、LA、Aorta、AorticRoot；单图 `error=null`。
 - [ ] 记录总耗时、六个子模型耗时和峰值 RSS，不以主观“快/慢”代替数字。
+
+现场记录：正常样本六模型最终完成，总耗时约 45 分钟，AorticRoot 阶段出现明显长尾。已有 CPU/RSS 采样误用了 Uvicorn 主进程而非推理子进程，故功能回归可通过，性能门禁仍记为 `FAIL/待治理`。
 
 ### 5.2 空收缩峰回归样本
 
