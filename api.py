@@ -1,4 +1,4 @@
-﻿"""
+"""
 心衰诊断 API (异步任务模式, 支持心超 + ECG 混合任务)。
 
 遵循《图像算法分析接口协议 v3》:
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Literal, Optional, Protocol
 
 from fastapi import FastAPI
@@ -217,7 +218,24 @@ def create_app(
     """
     if stale_running_seconds < 0:
         raise ValueError("stale_running_seconds 不能小于 0")
-    app = FastAPI(title="心衰诊断算法服务")
+    @asynccontextmanager
+    async def _app_lifespan(current_app: FastAPI):
+        # startup：恢复遗留的 running 任务，重新入队
+        for pending in current_app.state.store.recover_pending_tasks(
+            current_app.state.stale_running_seconds
+        ):
+            current_app.state.task_queue.enqueue(
+                _execute,
+                current_app,
+                pending.task_id,
+                pending.images,
+            )
+        yield
+        # shutdown：关闭进程内任务队列
+        if current_app.state.owns_task_queue:
+            current_app.state.task_queue.close(wait=True)
+
+    app = FastAPI(title="心衰诊断算法服务", lifespan=_app_lifespan)
     app.state.runner = runner
     app.state.store = store or InMemoryTaskStore()
     app.state.sync = sync
@@ -226,21 +244,6 @@ def create_app(
     app.state.stale_running_seconds = stale_running_seconds
     app.state.owns_task_queue = task_queue is None
     app.state.task_queue = task_queue or InProcessTaskQueue(worker_count=queue_worker_count)
-
-    @app.on_event("startup")
-    def _recover_pending_tasks() -> None:
-        for pending in app.state.store.recover_pending_tasks(stale_running_seconds):
-            app.state.task_queue.enqueue(
-                _execute,
-                app,
-                pending.task_id,
-                pending.images,
-            )
-
-    if app.state.owns_task_queue:
-        @app.on_event("shutdown")
-        def _close_task_queue() -> None:
-            app.state.task_queue.close(wait=True)
 
     @app.post("/heart-algo/task/start", response_model=StartResponse, response_model_exclude_none=True)
     def start(req: StartRequest):

@@ -1,4 +1,4 @@
-﻿"""心衰诊断算法服务启动入口（心超 + ECG 混合任务）。
+"""心衰诊断算法服务启动入口（心超 + ECG 混合任务）。
 
 配置优先级：CLI 参数/显式参数 > 环境变量 > config.py 内置默认值。
 """
@@ -165,10 +165,19 @@ def build_app(
     trusted_proxy_secret = os.environ.get("CASE_TRUSTED_PROXY_SECRET")
     service_user_id = os.environ.get("MCP_SERVICE_USER_ID", "mcp-service")
     if not use_fake:
-        @app.on_event("startup")
-        def acquire_case_store_lock() -> None:
+        _base_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def _case_lock_lifespan(current_app):
             # 必须在 worker 启动（fork 之后）获取，不能在 build_app/preload 阶段获取。
             case_store.acquire_instance_lock()
+            try:
+                async with _base_lifespan(current_app):
+                    yield
+            finally:
+                case_store.close_instance_lock()
+
+        app.router.lifespan_context = _case_lock_lifespan
     try:
         install_case_routes(
             app,
@@ -181,9 +190,6 @@ def build_app(
         case_store.close_instance_lock()
         raise
 
-    @app.on_event("shutdown")
-    def close_case_store_lock() -> None:
-        case_store.close_instance_lock()
     app.state.case_storage_root = str(case_store.root)
 
     resolved_mcp_enabled = mcp_enabled

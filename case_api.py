@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -318,7 +319,6 @@ def install_case_routes(
             declared_user_id, auth.user_id, require_authenticated_user
         )
 
-    @app.on_event("startup")
     def recover_reserved_case_submissions() -> None:
         """补建“病例已落盘、任务尚未创建”窗口里的任务。"""
         store: TaskStore = app.state.store
@@ -348,6 +348,16 @@ def install_case_routes(
                     app.state.task_queue.enqueue(
                         _execute, app, diagnosis["taskId"], images
                     )
+
+    _base_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _case_lifespan(current_app):
+        async with _base_lifespan(current_app):
+            recover_reserved_case_submissions()
+            yield
+
+    app.router.lifespan_context = _case_lifespan
 
     @app.get("/heart-algo/portal", include_in_schema=False)
     def case_portal():
