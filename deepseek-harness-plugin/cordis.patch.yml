@@ -1,0 +1,13 @@
+# Heart Algorithm MCP -> DeepSeek Harness tool bridge.
+# The token is resolved only when Harness loads the profile; do not write it here.
+- insert:
+    - id: heart-algo-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: heart-algo
+        transport: streamable-http
+        url: !!js "process.env.HEART_ALGO_MCP_URL || 'http://127.0.0.1:8000/mcp'"
+        headers: !!js "process.env.HEART_ALGO_MCP_TOKEN ? { Authorization: `Bearer ${process.env.HEART_ALGO_MCP_TOKEN}` } : {}"
+        # Submission and polling are separate, short calls; inference stays asynchronous.
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true

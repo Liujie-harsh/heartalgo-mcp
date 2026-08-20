@@ -11,8 +11,10 @@
   LVEF = (7*EDD³/(2.4+EDD) - 7*ESD³/(2.4+ESD)) / (7*EDD³/(2.4+EDD)) × 100
   输入 mm, 内部转 cm
 """
+import logging
 import os
 import subprocess
+
 import pandas as pd
 import pytest
 
@@ -104,10 +106,10 @@ class TestDcmTypeTasks:
         metrics = [t["metric"] for t in tasks]
         assert metrics == ["LVID", "IVS", "LVPW", "LA", "Aorta", "AorticRoot"]
 
-    def test_plax_lvid_has_phase_estimate(self):
-        # LVID 需要 --phase_estimate 产出 ED/ES 帧号
+    def test_plax_lvid_uses_distance_extrema_without_phase_overlay(self):
+        # Runner 从 distance CSV 取 ED/ES，不调用脚本内未消费的峰谷覆盖层。
         lvid_task = DCM_TYPE_TASKS["PLAX"][0]
-        assert "--phase_estimate" in lvid_task["extra"]
+        assert "--phase_estimate" not in lvid_task["extra"]
         assert lvid_task["value_rule"] == "ed_es"
 
     def test_plax_ivs_lvpw_use_ed_frame_rule(self):
@@ -334,6 +336,44 @@ class TestRunDispatch:
         # rois: LVID(2) + IVS(1) + LVPW(1) + LA(1) + Aorta(1) + AorticRoot(1) = 7 条线段
         assert len(per_img["rois"]) == 7
 
+    def test_plax_run_avoids_unused_phase_overlay(
+        self, runner, tmp_path, monkeypatch
+    ):
+        """服务从距离 CSV 取 ED/ES，不应触发未消费且可能失败的相位覆盖层。"""
+        commands = []
+
+        def successful_subprocess(command, **kwargs):
+            commands.append(command)
+            output_path = command[command.index("--output_path") + 1]
+            distance_csv = output_path.replace(".avi", "_distance.csv")
+            _make_csv(
+                tmp_path,
+                os.path.basename(distance_csv),
+                [3.5, 5.06, 4.0, 3.16],
+            )
+            os.replace(
+                tmp_path / os.path.basename(distance_csv),
+                distance_csv,
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr("echonet_runner.subprocess.run", successful_subprocess)
+        result = runner.run(
+            [
+                ImgItem(
+                    imgId="plax-safe",
+                    imgPath="plax.dcm",
+                    imgType="CARDIAC_ULTRASOUND",
+                    dcmType="PLAX",
+                )
+            ],
+            task_id="task-plax-safe",
+            work_root=str(tmp_path),
+        )
+
+        assert result["echo_per_image"]["plax-safe"]["lvedd"] == 50.6
+        assert "--phase_estimate" not in commands[0]
+
     def test_mv_ea_run_with_mocked_stdout(self, runner, tmp_path, monkeypatch):
         """MV_EA: stdout 解析 E_Vel/A_Vel/E/A, rois 为空。"""
         def fake_run_task(task, dcm_path, img_id, task_id, work_root, gpu_device=None):
@@ -371,6 +411,43 @@ class TestRunDispatch:
         per_img = result["echo_per_image"]["tapse-1"]
         assert per_img["tapse"] == 18.7
         assert per_img["rois"] == []
+
+    def test_measurement_subtask_logs_elapsed_seconds(
+        self, runner, tmp_path, monkeypatch, caplog
+    ):
+        """真实 CPU 调优需要按模型可追踪耗时，而不是只看到任务 processing。"""
+
+        monkeypatch.setattr(
+            "echonet_runner.subprocess.run",
+            lambda command, **kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="Peak Velocity = 64.12 cm/s",
+                stderr="",
+            ),
+        )
+        timestamps = iter([10.0, 12.3456])
+        monkeypatch.setattr(
+            "echonet_runner.time.perf_counter", lambda: next(timestamps)
+        )
+
+        with caplog.at_level(logging.INFO, logger="echonet_runner"):
+            result = runner.run(
+                [
+                    ImgItem(
+                        imgId="timed",
+                        imgPath="tr.dcm",
+                        imgType="CARDIAC_ULTRASOUND",
+                        dcmType="TR_Vmax",
+                    )
+                ],
+                task_id="task-timed",
+                work_root=str(tmp_path),
+            )
+
+        assert result["echo_per_image"]["timed"]["tr_vmax"] == 64.12
+        assert "metric=TR_Vmax" in caplog.text
+        assert "duration_seconds=2.346" in caplog.text
 
     def test_single_image_failure_isolated(self, runner, tmp_path, monkeypatch):
         """单图失败记录 error, 不中断其他图 (阶段 2 per-image try/except)。"""
@@ -424,3 +501,44 @@ class TestRunDispatch:
         )
 
         assert result["echo_per_image"]["oom"]["error"] == "心超模型显存不足，请稍后重试"
+
+    def test_windows_ctrl_c_exit_becomes_interrupted_error(
+        self, runner, tmp_path, monkeypatch, caplog
+    ):
+        """服务被 Ctrl+C 停止时，不应把子进程中断误报为模型故障。"""
+
+        def interrupted_subprocess(command, **kwargs):
+            raise subprocess.CalledProcessError(
+                returncode=0xC000013A,
+                cmd=command,
+                stderr="KeyboardInterrupt",
+            )
+
+        monkeypatch.setattr("echonet_runner.subprocess.run", interrupted_subprocess)
+        timestamps = iter([20.0, 24.5678])
+        monkeypatch.setattr(
+            "echonet_runner.time.perf_counter", lambda: next(timestamps)
+        )
+        with caplog.at_level(logging.ERROR, logger="echonet_runner"):
+            result = runner.run(
+                [
+                    ImgItem(
+                        imgId="interrupted",
+                        imgPath="plax.dcm",
+                        imgType="CARDIAC_ULTRASOUND",
+                        dcmType="PLAX",
+                    )
+                ],
+                task_id="task-interrupted",
+                work_root=str(tmp_path),
+            )
+
+        assert result["echo_per_image"]["interrupted"]["error"] == (
+            "心超推理被服务停止操作中断，请重新提交任务"
+        )
+        assert "duration_seconds=4.568" in caplog.text
+
+    def test_keyboard_interrupt_text_uses_conservative_interrupted_error(self, runner):
+        assert runner._script_error_message("KeyboardInterrupt") == (
+            "心超推理被中断，请确认服务状态后重新提交任务"
+        )

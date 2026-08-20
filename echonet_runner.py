@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 import pandas as pd
 from algorithm_errors import AlgorithmError
@@ -77,8 +78,9 @@ SLICE_DIR_MAP = {
 DCM_TYPE_TASKS: dict[str, list[dict]] = {
     # ===== 分支1: B-Mode (inference_2D_image.py, CSV 单位 cm → ×10 转 mm) =====
     "PLAX": [
-        # LVID 必须第一个跑: --phase_estimate 产出 ED/ES 帧号, 供 IVS/LVPW 使用
-        {"metric": "LVID",       "script": "inference_2D_image.py", "weights": "lvid",        "extra": ["--phase_estimate"], "value_rule": "ed_es"},
+        # LVID 必须第一个跑；服务从 distance CSV 全局极值取得 ED/ES 帧号。
+        # 不请求脚本的相位覆盖层：其峰谷结果未被服务消费，且短片可能返回空数组。
+        {"metric": "LVID",       "script": "inference_2D_image.py", "weights": "lvid",        "extra": [],                   "value_rule": "ed_es"},
         {"metric": "IVS",        "script": "inference_2D_image.py", "weights": "ivs",         "extra": [],                   "value_rule": "ed_frame"},
         {"metric": "LVPW",       "script": "inference_2D_image.py", "weights": "lvpw",        "extra": [],                   "value_rule": "ed_frame"},
         {"metric": "LA",         "script": "inference_2D_image.py", "weights": "la",          "extra": [],                   "value_rule": "max_bm"},
@@ -271,6 +273,7 @@ class EchoNetRunner:
         cmd += ["--file_path", dcm_path, "--output_path", out_file]
         cmd += task["extra"]
 
+        started = time.perf_counter()
         try:
             result = subprocess.run(
                 cmd,
@@ -289,25 +292,49 @@ class EchoNetRunner:
                 },
             )
         except subprocess.TimeoutExpired as error:
+            duration_seconds = time.perf_counter() - started
+            logger.error(
+                "心超子任务超时 metric=%s script=%s duration_seconds=%.3f",
+                task["metric"],
+                task["script"],
+                duration_seconds,
+            )
             raise EchoInferenceError(
                 f"{task['metric']} 心超推理超时（超过 {self.config.timeout_seconds} 秒）"
             ) from error
         except subprocess.CalledProcessError as e:
+            duration_seconds = time.perf_counter() - started
             detail = (e.stderr or e.stdout or "").strip()
             logger.error(
-                "心超子进程失败 script=%s return_code=%s stderr=%s",
+                "心超子进程失败 metric=%s script=%s return_code=%s "
+                "duration_seconds=%.3f stderr=%s",
+                task["metric"],
                 task["script"],
                 e.returncode,
+                duration_seconds,
                 detail[-4000:],
             )
-            raise EchoInferenceError(self._script_error_message(detail)) from e
+            raise EchoInferenceError(
+                self._script_error_message(detail, return_code=e.returncode)
+            ) from e
+        duration_seconds = time.perf_counter() - started
+        logger.info(
+            "心超子任务完成 metric=%s script=%s duration_seconds=%.3f",
+            task["metric"],
+            task["script"],
+            duration_seconds,
+        )
         csv_path = out_file.replace(ext, "_distance.csv") if ext == ".avi" else None
         return csv_path, result.stdout
 
     @staticmethod
-    def _script_error_message(detail: str) -> str:
+    def _script_error_message(detail: str, *, return_code: int | None = None) -> str:
         """把稳定的子进程错误特征翻译为可公开中文消息。"""
         normalized = detail.lower()
+        if return_code in {0xC000013A, -1073741510}:
+            return "心超推理被服务停止操作中断，请重新提交任务"
+        if "keyboardinterrupt" in normalized:
+            return "心超推理被中断，请确认服务状态后重新提交任务"
         if "out of memory" in normalized:
             return "心超模型显存不足，请稍后重试"
         if "no such file or directory" in normalized or "file not found" in normalized:
