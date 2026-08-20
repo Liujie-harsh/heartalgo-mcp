@@ -8,6 +8,6 @@
         transport: streamable-http
         url: !!js "process.env.HEART_ALGO_MCP_URL || 'http://127.0.0.1:8000/mcp'"
         headers: !!js "process.env.HEART_ALGO_MCP_TOKEN ? { Authorization: `Bearer ${process.env.HEART_ALGO_MCP_TOKEN}` } : {}"
-        # The MCP API accepts wait_seconds up to 120 seconds; leave transport overhead.
-        toolCallTimeoutMs: 130000
+        # Submission and polling are separate, short calls; inference stays asynchronous.
+        toolCallTimeoutMs: 60000
         failOnStartupError: true
