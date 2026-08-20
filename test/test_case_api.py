@@ -202,6 +202,9 @@ def test_production_app_mounts_case_api_and_mcp_endpoint(tmp_path):
     assert portal.status_code == 200
     assert "非 Agent" in portal.text
     assert "临床复核" in portal.text
+    assert "纯 CPU 的 PLAX" in portal.text
+    assert "请勿停止服务" in portal.text
+    assert "已等待" in portal.text
     assert created.status_code == 201
     assert hasattr(app.state, "mcp_server")
     assert any(route.path == "/mcp" for route in app.routes)
