@@ -34,7 +34,7 @@
       <label>心超 DICOM（可选）<input id="echo" type="file" accept=".dcm,application/dicom"></label>
       <label>心电 XML（可选）<input id="ecg" type="file" accept=".xml,text/xml,application/xml"></label>
     </div>
-    <p class="warning" id="runtime-hint">纯 CPU 的 PLAX 会依次运行 6 个测量模型，通常需要数分钟。任务显示 processing 时请勿停止服务或关闭本页。</p>
+    <p class="warning" id="runtime-hint">纯 CPU 的 PLAX 会依次运行 6 个测量模型，通常需要数分钟。任务显示 processing 时请勿停止服务；关闭本页只会停止进度显示，不会取消后台任务。</p>
     <div class="actions"><button id="run">创建病例、上传并提交</button></div>
   </section>
 

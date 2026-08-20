@@ -42,7 +42,7 @@ Set-Location D:\project\heart
 python -m pytest -q
 ```
 
-通过条件：`192 passed, 7 skipped`。若最终提交后的数量变化，以“零失败且跳过项仍有明确原因”为准，并记录完整摘要。
+通过条件：`193 passed, 7 skipped`。若最终提交后的数量变化，以“零失败且跳过项仍有明确原因”为准，并记录完整摘要。
 
 证据：`D:\heart-data\validation\pytest-summary.txt`
 
@@ -119,7 +119,9 @@ $oldAfter | Select-Object caseId,taskId,status,algorithmVersion
 ### 5.2 空收缩峰回归样本
 
 - 输入：`00005_851deaabbf3089ae.dcm` 对应的去标识化服务器副本。
-- [ ] 不再出现 `systolic_i[0]` 的 `IndexError`。
+- [ ] 任务 `status=completed`，且 `cardiacUltrasound[0].error=null`。
+- [ ] 报告包含 LVID、IVS、LVPW、LA、Aorta、AorticRoot 六项输出。
+- [ ] 日志不再出现 `systolic_i[0]` 的 `IndexError`，并记录六个子模型耗时与任务总耗时。
 - [ ] 若 distance CSV 可用，结果仍必须经过第 7 节临床校准；技术完成不代表数值可信。
 
 ### 5.3 中断语义

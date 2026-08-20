@@ -11,9 +11,10 @@
   LVEF = (7*EDD³/(2.4+EDD) - 7*ESD³/(2.4+ESD)) / (7*EDD³/(2.4+EDD)) × 100
   输入 mm, 内部转 cm
 """
+import logging
 import os
 import subprocess
-import logging
+
 import pandas as pd
 import pytest
 
@@ -536,3 +537,8 @@ class TestRunDispatch:
             "心超推理被服务停止操作中断，请重新提交任务"
         )
         assert "duration_seconds=4.568" in caplog.text
+
+    def test_keyboard_interrupt_text_uses_conservative_interrupted_error(self, runner):
+        assert runner._script_error_message("KeyboardInterrupt") == (
+            "心超推理被中断，请确认服务状态后重新提交任务"
+        )

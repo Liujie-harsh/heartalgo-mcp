@@ -331,8 +331,10 @@ class EchoNetRunner:
     def _script_error_message(detail: str, *, return_code: int | None = None) -> str:
         """把稳定的子进程错误特征翻译为可公开中文消息。"""
         normalized = detail.lower()
-        if return_code in {0xC000013A, -1073741510} or "keyboardinterrupt" in normalized:
+        if return_code in {0xC000013A, -1073741510}:
             return "心超推理被服务停止操作中断，请重新提交任务"
+        if "keyboardinterrupt" in normalized:
+            return "心超推理被中断，请确认服务状态后重新提交任务"
         if "out of memory" in normalized:
             return "心超模型显存不足，请稍后重试"
         if "no such file or directory" in normalized or "file not found" in normalized:

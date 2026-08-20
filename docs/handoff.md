@@ -46,7 +46,7 @@ hydra-core / omegaconf / wfdb / scikit-learn / matplotlib / tqdm：已装
 
 **说明**：`ecg-transform 0.1.3` 的元数据声明 `numpy>=2.1.3`，因此 `pip check` 当前仍返回依赖冲突；但服务器已在 numpy 1.26.4 下用真实权重完成 ECG 直接推理。联调期间不要为消除元数据提示而直接升级 numpy；生产前仍需通过兼容版本、移除未使用依赖或拆分环境正式消除冲突。
 
-服务器数据库状态：应用专用 MySQL 账号已通过 SQLAlchemy 实连验证，当前数据库为 `heart_failure_analytics_dev`。连接串只通过当前 PowerShell 进程的 `DATABASE_URL` 注入；本文不记录用户名或口令。此前口令曾出现在联调记录/会话中，正式部署前必须轮换并清理可访问日志。
+服务器数据库状态：应用专用 MySQL 账号已通过 SQLAlchemy 实连验证，当前数据库为 `heart_failure_analytics_dev`。连接串只通过当前 PowerShell 进程的 `DATABASE_URL` 注入；本文不记录口令。此前口令曾出现在联调记录/会话中，正式部署前必须轮换并清理可访问日志。
 
 当前病例联调为受控的本机回环模式：`CASE_AUTH_REQUIRED=false`、`ALLOW_INSECURE_CASE_API=true`、`127.0.0.1:8000`。这只适合服务器本机 smoke test，不是生产安全配置。
 
@@ -121,7 +121,7 @@ hydra-core / omegaconf / wfdb / scikit-learn / matplotlib / tqdm：已装
 - `3c1464f fix: harden reliable diagnosis workflow`
 - `8f81cc4 feat: add P0 P1 reliability validation gates`
 
-服务器已部署版本的测试基线为 `189 passed, 7 skipped`；本地 PLAX 修复候选为 `192 passed, 7 skipped`，部署后需在服务器复现该基线。详细端点、幂等、鉴权、锁和恢复边界见 `docs\phase1-reliable-loop.md`；P0/P1 发布与验证命令见 `docs\p0-p1-validation.md`。
+服务器已部署版本的测试基线为 `189 passed, 7 skipped`；本地 PLAX 修复候选为 `193 passed, 7 skipped`，部署后需在服务器复现该基线。详细端点、幂等、鉴权、锁和恢复边界见 `docs\phase1-reliable-loop.md`；P0/P1 发布与验证命令见 `docs\p0-p1-validation.md`。
 
 ### 4.5 P0/P1 可靠性门禁（工程实现已完成并部署）
 
@@ -206,7 +206,7 @@ conda activate heart
 # ── 1. Measurement 2D ──
 cd D:\project\Measurement\Measurement
 python inference_2D_image.py --model_weights la  --file_path "D:\heart-data\cases\test\dcm\a4c\00007_f740c695836ad433.dcm"  --output_path "D:\heart-data\cases\test\output\la_a4c_00007.avi"
-python inference_2D_image.py --model_weights lvid --file_path "D:\heart-data\cases\test\dcm\plax\00003_2dbbf05f7a19120f.dcm" --output_path "D:\heart-data\cases\test\output\lvid_plax_00003.avi" --phase_estimate
+python inference_2D_image.py --model_weights lvid --file_path "D:\heart-data\cases\test\dcm\plax\00003_2dbbf05f7a19120f.dcm" --output_path "D:\heart-data\cases\test\output\lvid_plax_00003.avi"
 
 # ── 2. Measurement Doppler ──
 cd D:\project\Measurement\Measurement
@@ -340,7 +340,7 @@ $env:ALGORITHM_VERSION = (Get-Content -Raw "D:\heart-data\validation\release-man
 ## 10. 建议下一会话使用的技能
 
 - `diagnosing-bugs`：定位新版本服务、PowerShell 中文显示或真实推理异常；先建立最小复现和证据链。
-- `tdd`：若服务器冒烟暴露回归，先把真实失败压缩为自动化测试，再修改实现并回跑本地 `192 passed, 7 skipped` 基线。
+- `tdd`：若服务器冒烟暴露回归，先把真实失败压缩为自动化测试，再修改实现并回跑本地 `193 passed, 7 skipped` 基线。
 - `implement`：在明确发布标识、鉴权网关或服务托管需求后实施变更，并保持现有可靠闭环测试通过。
 - `review`：生产部署前从规格与工程标准两条线复核鉴权、路径脱敏、单实例约束、持久化和临床复核权限。
 

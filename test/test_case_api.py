@@ -204,6 +204,8 @@ def test_production_app_mounts_case_api_and_mcp_endpoint(tmp_path):
     assert "临床复核" in portal.text
     assert "纯 CPU 的 PLAX" in portal.text
     assert "请勿停止服务" in portal.text
+    assert "关闭本页只会停止进度显示" in portal.text
+    assert "不会取消后台任务" in portal.text
     assert "已等待" in portal.text
     assert created.status_code == 201
     assert hasattr(app.state, "mcp_server")
