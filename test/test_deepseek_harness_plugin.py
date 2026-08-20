@@ -40,6 +40,7 @@ def test_bundle_documents_install_start_and_expected_tools():
     readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
 
     assert "dsh plugin --profile web add" in readme
+    assert "pnpm" in readme
     assert "MCP_ENABLED=true" in readme
     assert "MCP_SHARED_SECRET" in readme
     assert "POST /heart-algo/cases" in readme

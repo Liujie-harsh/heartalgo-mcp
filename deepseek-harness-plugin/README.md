@@ -15,6 +15,7 @@
 ## 前置条件
 
 - Node.js 20.12 或更高版本，以及可用的 DeepSeek Harness CLI；
+- `pnpm` 已加入 `PATH`（`dsh plugin` 会把依赖管理命令转发给 pnpm；可先运行 `corepack enable`）；
 - 心衰算法服务可从 Harness 所在主机访问；
 - 生产模式下，插件 Token 与算法服务的 `MCP_SHARED_SECRET` 必须一致。
 
