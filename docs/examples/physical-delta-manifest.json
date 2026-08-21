@@ -1,0 +1,16 @@
+{
+  "_instructions": "替换算法版本、模型真实坐标、人工金标准和临床批准的容差",
+  "algorithmVersion": "heart@3c1464f+models@0123456789abcdef",
+  "dcmType": "PLAX",
+  "measurements": [
+    {
+      "name": "lvid",
+      "points": [[100, 50], [400, 450]],
+      "axis": "euclidean",
+      "goldStandard": 5.1,
+      "goldStandardUnit": "cm",
+      "absoluteTolerance": 0.2,
+      "relativeTolerancePercent": 5.0
+    }
+  ]
+}

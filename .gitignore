@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.pytest-tmp*/
+pytest-run-*/
+.tmp-*/
+.codex_pytest_temp/
+.runtime/
+.npm-cache/
+logs/
+verify/tmp/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# 基础设施敏感配置（含密码）
+database/.env.infrastructure

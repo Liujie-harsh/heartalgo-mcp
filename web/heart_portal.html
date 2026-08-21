@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>心脏算法非 Agent 联调门户</title>
+  <style>
+    :root{color-scheme:light;--ink:#17322e;--muted:#63736f;--line:#d8e2df;--accent:#087f6b;--bg:#f4f7f6}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,"Microsoft YaHei",sans-serif}
+    main{max-width:960px;margin:36px auto;padding:0 18px}header,.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:16px}
+    h1,h2{margin:0 0 10px}h1{font-size:25px}h2{font-size:18px}.hint{color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}label{display:grid;gap:6px;font-weight:650}
+    input,select,textarea,button{font:inherit;border:1px solid #b9c8c4;border-radius:8px;padding:10px;background:#fff}textarea{min-height:80px}
+    button{cursor:pointer;background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}button.secondary{background:#fff;color:var(--accent)}
+    button:disabled{opacity:.5;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:15px}
+    pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#10221f;color:#dff7f1;border-radius:10px;padding:16px;min-height:150px}
+    .warning{border-left:4px solid #c26a17;padding-left:12px}.status{font-weight:700;color:var(--accent)}
+  </style>
+</head>
+<body><main>
+  <header>
+    <h1>心脏算法非 Agent 可靠闭环</h1>
+    <p class="warning">本页面仅用于算法联调和临床辅助验证，输出不能替代医生诊断。上传内容不会发送给 LLM。</p>
+    <div class="status" id="status">尚未开始</div>
+  </header>
+
+  <section class="card">
+    <h2>1. 病例与输入</h2>
+    <div class="grid">
+      <label>操作用户 ID<input id="user" value="doctor-demo" autocomplete="off"></label>
+      <label>心超切面
+        <select id="view"><option>PLAX</option><option>A4C</option><option>Subcostal</option><option>RVOT</option><option>MV_EA</option><option>AV_Vmax</option><option>TR_Vmax</option><option>MR_Vmax</option><option>LVOT_Vmax</option><option>TDI_Medial</option><option>TDI_Lateral</option><option>TAPSE</option></select>
+      </label>
+      <label>心超 DICOM（可选）<input id="echo" type="file" accept=".dcm,application/dicom"></label>
+      <label>心电 XML（可选）<input id="ecg" type="file" accept=".xml,text/xml,application/xml"></label>
+    </div>
+    <p class="warning" id="runtime-hint">纯 CPU 的 PLAX 会依次运行 6 个测量模型，通常需要数分钟。任务显示 processing 时请勿停止服务；关闭本页只会停止进度显示，不会取消后台任务。</p>
+    <div class="actions"><button id="run">创建病例、上传并提交</button></div>
+  </section>
+
+  <section class="card">
+    <h2>2. 结构化算法报告</h2>
+    <pre id="output">等待任务提交……</pre>
+  </section>
+
+  <section class="card">
+    <h2>3. 临床复核</h2>
+    <div class="grid">
+      <label>复核医生 ID<input id="reviewer" value="cardiologist-demo" autocomplete="off"></label>
+      <label>复核说明<textarea id="comment" placeholder="填写核对依据或驳回原因"></textarea></label>
+    </div>
+    <div class="actions">
+      <button id="approve" disabled>批准</button>
+      <button id="reject" class="secondary" disabled>驳回</button>
+    </div>
+  </section>
+</main>
+<script>
+  const $=id=>document.getElementById(id), state={caseId:null,taskId:null};
+  const requestId=prefix=>`${prefix}-${crypto.randomUUID()}`;
+  const show=(message,data)=>{$('status').textContent=message;if(data!==undefined)$('output').textContent=JSON.stringify(data,null,2)};
+  async function jsonFetch(url,options={}){const r=await fetch(url,options);let data;try{data=await r.json()}catch{data={detail:await r.text()}}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data));return data}
+  async function upload(caseId,user,modality,file,dcmType){if(!file)return null;const form=new FormData();form.append('sysUserId',user);form.append('modality',modality);if(dcmType)form.append('dcmType',dcmType);form.append('file',file);return jsonFetch(`/heart-algo/cases/${caseId}/assets`,{method:'POST',body:form})}
+  async function poll(user){const startedAt=Date.now();for(;;){const data=await jsonFetch(`/heart-algo/cases/${state.caseId}/diagnoses/${state.taskId}?sys_user_id=${encodeURIComponent(user)}`);const elapsed=Math.floor((Date.now()-startedAt)/1000);show(data.status==='processing'?`任务状态：processing（已等待 ${elapsed} 秒）`:`任务状态：${data.status}`,data);if(data.status!=='processing'){if(data.status==='completed'){$('approve').disabled=false;$('reject').disabled=false}return}await new Promise(r=>setTimeout(r,5000))}}
+  $('run').onclick=async()=>{const user=$('user').value.trim(),echo=$('echo').files[0],ecg=$('ecg').files[0];if(!user||(!echo&&!ecg)){show('请填写用户并至少选择一个文件');return}$('run').disabled=true;try{show('正在创建病例……');const c=await jsonFetch('/heart-algo/cases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestId:requestId('case'),sysUserId:user})});state.caseId=c.caseId;show('正在上传资产……',c);await upload(c.caseId,user,'CARDIAC_ULTRASOUND',echo,$('view').value);await upload(c.caseId,user,'ECG',ecg,null);const d=await jsonFetch(`/heart-algo/cases/${c.caseId}/diagnoses`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({requestId:requestId('diagnosis'),sysUserId:user})});state.taskId=d.taskId;show('任务已提交',d);await poll(user)}catch(e){show(`失败：${e.message}`)}finally{$('run').disabled=false}};
+  async function review(decision){const user=$('user').value.trim();try{const data=await jsonFetch(`/heart-algo/cases/${state.caseId}/diagnoses/${state.taskId}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sysUserId:user,reviewerId:$('reviewer').value.trim(),decision,comment:$('comment').value})});show(`临床复核已记录：${decision}`,data);await poll(user)}catch(e){show(`复核失败：${e.message}`)}}
+  $('approve').onclick=()=>review('approved');$('reject').onclick=()=>review('rejected');
+</script></body></html>

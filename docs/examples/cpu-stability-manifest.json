@@ -1,0 +1,51 @@
+{
+  "_instructions": "替换算法版本和服务器上的去标识化测试文件路径",
+  "algorithmVersion": "heart@3c1464f+models@0123456789abcdef",
+  "iterations": 3,
+  "maxRunSeconds": 900,
+  "scenarios": [
+    {
+      "name": "ecg-only",
+      "inputs": [
+        {
+          "imgId": "ecg-benchmark",
+          "imgPath": "D:\\heart-data\\cases\\test\\ecg\\2.xml",
+          "imgType": "ECG"
+        }
+      ]
+    },
+    {
+      "name": "all-echo-views",
+      "inputs": [
+        {"imgId": "plax-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\PLAX\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "PLAX"},
+        {"imgId": "a4c-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\A4C\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "A4C"},
+        {"imgId": "subcostal-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\Subcostal\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "Subcostal"},
+        {"imgId": "rvot-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\RVOT\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "RVOT"},
+        {"imgId": "mv-ea-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\MV_EA\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "MV_EA"},
+        {"imgId": "av-vmax-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\AV_Vmax\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "AV_Vmax"},
+        {"imgId": "tr-vmax-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\TR_Vmax\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "TR_Vmax"},
+        {"imgId": "mr-vmax-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\MR_Vmax\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "MR_Vmax"},
+        {"imgId": "lvot-vmax-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\LVOT_Vmax\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "LVOT_Vmax"},
+        {"imgId": "tdi-medial-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\TDI_Medial\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "TDI_Medial"},
+        {"imgId": "tdi-lateral-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\TDI_Lateral\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "TDI_Lateral"},
+        {"imgId": "tapse-benchmark", "imgPath": "D:\\heart-data\\cases\\test\\dcm\\TAPSE\\sample.dcm", "imgType": "CARDIAC_ULTRASOUND", "dcmType": "TAPSE"}
+      ]
+    },
+    {
+      "name": "mixed-tr-vmax-ecg",
+      "inputs": [
+        {
+          "imgId": "tr-mixed-benchmark",
+          "imgPath": "D:\\heart-data\\cases\\test\\dcm\\TR_Vmax\\00006_4ca03022ca3e030f.dcm",
+          "imgType": "CARDIAC_ULTRASOUND",
+          "dcmType": "TR_Vmax"
+        },
+        {
+          "imgId": "ecg-mixed-benchmark",
+          "imgPath": "D:\\heart-data\\cases\\test\\ecg\\2.xml",
+          "imgType": "ECG"
+        }
+      ]
+    }
+  ]
+}

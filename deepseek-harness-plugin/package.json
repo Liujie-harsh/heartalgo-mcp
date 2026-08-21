@@ -1,0 +1,29 @@
+{
+  "name": "heart-algo-dsh-plugin",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness bundle for the heart failure diagnosis MCP service",
+  "type": "module",
+  "files": [
+    "cordis.patch.yml",
+    "README.md",
+    "scripts/check.mjs"
+  ],
+  "scripts": {
+    "check": "node scripts/check.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "mcp",
+    "heart-failure"
+  ],
+  "engines": {
+    "node": ">=20.12.0"
+  },
+  "license": "UNLICENSED",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
