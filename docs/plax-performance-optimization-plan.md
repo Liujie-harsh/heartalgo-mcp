@@ -276,8 +276,38 @@ MEASUREMENT_VIDEO_MODE=synchronous|asynchronous
 P0 代码落点：单模型通过 `--timings_path` 写原子 JSON，服务汇总为任务图像
 `echo/plax-stage-timings.json`；进程树使用
 `python quality/plax_process_monitor.py --pid <PID> --output <全新 JSONL>` 采样。
-P1 持久 Worker 按本方案门禁，须先完成上述冷/热基准和阶段占比后再选择
-`single_slot` 或 `preload_all`，避免在证据不足时固化错误驻留策略。
+
+截至 2026-08-21，本机（即当前服务器）已使用同一份 94 帧去标识化 PLAX
+DICOM 完成以下阶段计时：
+
+| 运行 | PyTorch CPU 线程 | 总耗时 | 前向推理 | 前向占比 | 距离视频 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LVID 冷启动 | 1 | 437.375 秒 | 417.594 秒 | 95.48% | 12.219 秒 |
+| IVS 冷启动 | 1 | 441.485 秒 | 419.417 秒 | 95.00% | 13.736 秒 |
+| LVID 后续运行 | 1 | 439.019 秒 | 418.397 秒 | 95.30% | 12.834 秒 |
+
+上述完整运行均使用算法版本
+`heart@237fc29+models@4bf76612484dd393`，实际设备为 CPU，逻辑核心数为 12；
+对应进程树峰值 RSS 约为 1.69–1.71 GiB。Python 导入约 4 秒，模型构建、
+checkpoint 读取和 state dict 加载合计约 1–2 秒，DICOM 解码、resize 和张量准备
+合计约 2 秒。阶段之和与总耗时差额低于 0.05%。证据目录为
+`D:\heart-data\validation\perf-plax-stage-20260821-145440`。
+
+冷/热矩阵项仍未勾选：目前只有一次完整 LVID 后续运行，尚未完成“完整六模型冷启动
+1 次、热启动至少 3 次”。六模型阶段占比项也仍未勾选：LVID 和 IVS 的证据高度一致，
+但不能用两个模型冒充六模型完整报告。
+
+CPU 环境核对为部分完成：默认 `torch.get_num_threads()=1`、
+`torch.get_num_interop_threads()=6`；仅设置 `OMP_NUM_THREADS=6` 和
+`MKL_NUM_THREADS=6` 未改变 PyTorch intra-op 线程数。新增显式
+`--torch_num_threads 6` 后确认约六核实际参与，但运行超过 551 秒仍未完成，性能差于
+单线程，已作为负优化中止并保留 `partial` 进程树。磁盘读取量已记录；进程亲和性在
+Windows 当前采集路径中为 `null`，杀毒软件影响尚未做隔离对照，因此该项保持未完成。
+
+当前阶段性判断：已测模型的前向占比均超过 95%，明确超过 GPU 试点的 50% 门槛；
+持久 Worker、输入复用和视频异步化仍有工程价值，但按现有占比无法单独把六模型任务
+降至 10 分钟。应进入单模型 GPU 小规模对照，同时继续补齐六模型冷/热矩阵；在获得
+显存峰值和结果一致性证据前不得确定采购规格。
 
 ### P1：实现持久 Worker
 
