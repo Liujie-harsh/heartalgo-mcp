@@ -336,6 +336,29 @@ class FileCaseStore:
                     return metadata["caseId"]
         raise CaseNotFoundError("诊断任务不存在")
 
+    def list_cases_for_service(self, service_user_id: str) -> list[dict]:
+        """列出授权给服务账号的病例摘要（不含磁盘路径）。"""
+        _validate_id(service_user_id, "serviceUserId")
+        summaries: list[dict] = []
+        with self._lock:
+            for metadata_path in sorted(self.root.glob("case-*/case.json")):
+                try:
+                    metadata = self._read_json(metadata_path)
+                except CaseStoreError:
+                    continue
+                if service_user_id not in metadata.get("authorizedServiceIds", []):
+                    continue
+                review = metadata.get("review") or {}
+                summaries.append({
+                    "caseId": metadata["caseId"],
+                    "sysUserId": metadata.get("sysUserId"),
+                    "createdAt": metadata.get("createdAt"),
+                    "assetCount": len(metadata.get("assets", [])),
+                    "diagnosisCount": len(metadata.get("diagnoses", [])),
+                    "reviewDecision": review.get("decision"),
+                })
+        return summaries
+
     def diagnosis_belongs_to_case(
         self, case_id: str, sys_user_id: str, task_id: str
     ) -> bool:
@@ -384,9 +407,85 @@ class FileCaseStore:
                 for asset in metadata["assets"]
             ],
             "diagnoses": list(metadata["diagnoses"]),
+            "artifacts": [
+                {key: value for key, value in artifact.items() if key != "path"}
+                for artifact in metadata.get("artifacts", [])
+            ],
             "review": metadata.get("review"),
             "reviewHistory": list(metadata.get("reviewHistory", [])),
         }
+
+    def save_case_artifact(
+        self,
+        case_id: str,
+        sys_user_id: str,
+        artifact_id: str,
+        content: str | bytes,
+    ) -> dict:
+        """把报告等工件原子写入病例目录并登记元数据；同 ID 同内容幂等。"""
+        _validate_id(case_id, "caseId")
+        _validate_id(sys_user_id, "sysUserId")
+        _validate_id(artifact_id, "artifactId")
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        if not data:
+            raise CaseStoreError("工件内容为空")
+        digest = hashlib.sha256(data).hexdigest()
+        with self._lock:
+            metadata = self.get_case(case_id, sys_user_id)
+            artifacts = metadata.setdefault("artifacts", [])
+            existing = next(
+                (item for item in artifacts if item["artifactId"] == artifact_id),
+                None,
+            )
+            if existing is not None:
+                if existing["sha256"] == digest:
+                    return existing
+                raise CaseConflictError("artifactId 已用于其他内容")
+            directory = self.root / case_id / "artifacts"
+            directory.mkdir(parents=True, exist_ok=True)
+            destination = directory / artifact_id
+            partial = directory / f".{artifact_id}-{uuid4().hex}.part"
+            try:
+                partial.write_bytes(data)
+                os.replace(partial, destination)
+            finally:
+                partial.unlink(missing_ok=True)
+            artifact = {
+                "artifactId": artifact_id,
+                "sha256": digest,
+                "sizeBytes": len(data),
+                "createdAt": _utc_now(),
+                "path": str(destination),
+            }
+            artifacts.append(artifact)
+            self._write_case(metadata)
+            return artifact
+
+    def read_case_artifact(
+        self, case_id: str, sys_user_id: str, artifact_id: str
+    ) -> tuple[str, dict]:
+        """读取病例工件文本内容及其元数据（返回值不含磁盘路径）。"""
+        _validate_id(case_id, "caseId")
+        _validate_id(sys_user_id, "sysUserId")
+        _validate_id(artifact_id, "artifactId")
+        metadata = self.get_case(case_id, sys_user_id)
+        artifact = next(
+            (
+                item
+                for item in metadata.get("artifacts", [])
+                if item["artifactId"] == artifact_id
+            ),
+            None,
+        )
+        if artifact is None:
+            raise CaseNotFoundError("工件不存在")
+        path = self.root / case_id / "artifacts" / artifact_id
+        if not path.is_file():
+            raise CaseNotFoundError("工件文件缺失")
+        try:
+            return path.read_text(encoding="utf-8"), artifact
+        except OSError as exc:
+            raise CaseStoreError("工件读取失败") from exc
 
     @staticmethod
     def _validate_content(modality: str, head: bytes) -> None:

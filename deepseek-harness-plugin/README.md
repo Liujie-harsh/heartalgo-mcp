@@ -71,8 +71,13 @@ Python 服务的任务队列中异步执行，不会占用一次 MCP 调用等�
 
 ## 调用前的数据准备
 
-当前 MCP 契约只分析已经登记到病例存储的资产，不直接接收文件路径或 URL。调用方应先
-通过病例 HTTP API 完成以下步骤：
+MCP 工具面支持两条输入路径：
+
+**路径 A（一站式）**：直接调用 `mcp__heart-algo__analyze_case_files`，传入本地文件
+路径列表（每项含 `path`、`modality`，心超另需 `dcm_type`），服务会自动创建病例、
+登记资产并提交分析。病例归属 `MCP_SERVICE_USER_ID` 服务账号，适合 Agent 自主闭环。
+
+**路径 B（病例门户）**：仍可先通过病例 HTTP API 完成登记，适合归属真实医生的病例：
 
 1. `POST /heart-algo/cases` 创建病例。请求体包含 `requestId` 和 `sysUserId`；
 2. `POST /heart-algo/cases/{case_id}/assets` 以 multipart 上传心超 DICOM 或 ECG XML；
@@ -86,8 +91,31 @@ Python 服务的任务队列中异步执行，不会占用一次 MCP 调用等�
 
 连接成功后，模型会看到以下工具：
 
+**输入与分析**
+
+- `mcp__heart-algo__analyze_case_files`：一站式分析——从本地文件路径创建病例、登记资产并提交诊断，返回 `case_id` 与 `task_id`；
 - `mcp__heart-algo__diagnose_heart_failure`：用 `case_id` 和可选 `asset_ids` 提交诊断任务，立即返回 `task_id`；
-- `mcp__heart-algo__get_diagnosis_result`：按 `task_id` 查询长任务；
+- `mcp__heart-algo__get_diagnosis_result`：按 `task_id` 查询长任务。
+
+**解读与报告**
+
+- `mcp__heart-algo__interpret_diagnosis`：规则解读——按参考范围标注异常指标、输出 LVEF 分型（HFrEF/HFmrEF/HFpEF）与 E/A、E/e' 等组合指标；
+- `mcp__heart-algo__generate_report`：把已完成任务渲染成 Markdown/JSON 报告草稿，可 `save_to_case` 存回病例工件；
+- `mcp__heart-algo__compare_diagnoses`：同病例两次任务的指标纵向对比（绝对/相对变化、LVEF 分型迁移）。
+
+**病例与任务检索**
+
+- `mcp__heart-algo__list_cases`：列出服务账号可见的病例摘要；
+- `mcp__heart-algo__get_case_detail`：病例资产、任务实时状态、复核历史与报告工件详情；
+- `mcp__heart-algo__list_tasks`：任务列表，可按 `case_id` 过滤。
+
+**临床复核**
+
+- `mcp__heart-algo__get_review_status`：查询任务的复核状态与历史；
+- `mcp__heart-algo__submit_review`：记录临床复核结论（approved/rejected）；复核人不能是病例所有者。
+
+**能力发现**
+
 - `mcp__heart-algo__list_supported_views`：查询支持的切面与指标。
 
 例如可让 Agent 执行：

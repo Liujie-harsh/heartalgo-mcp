@@ -20,3 +20,11 @@ venv/
 
 # 基础设施敏感配置（含密码）
 database/.env.infrastructure
+# heart-health-dsh-suite 独立仓库（含 .git，勿纳入本仓库）
+heart-health-dsh-suite/
+# 构建/联调临时产物
+.dsh-peek/
+.e2e-tmp/
+.runtime-e2e/
+*.log
+.pytest-err.txt
